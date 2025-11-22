@@ -31,6 +31,12 @@ def main():
         creds=creds,
     )
 
+    print(f"Host: {host}")
+    print(f"Address: {client.get_address()}")
+    print(f"Signature type: {sig_type}")
+    print(f"Funder: {funder}")
+    print(f"API key: {creds.api_key}")
+
     # Create and sign a tiny limit order: buy 0.01 YES @ $0.01
     order_args = OrderArgs(
         price=0.01,
