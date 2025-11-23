@@ -1,3 +1,4 @@
+import os
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BookParams
 
@@ -9,10 +10,10 @@ def main():
     resp = client.get_spreads(
         params=[
             BookParams(
-                token_id="71321045679252212594626385532706912750332728571942532289631379312455583992563"
+                token_id="30781390935964643809169938652265452487584631554843464153358559865968760704577"
             ),
             BookParams(
-                token_id="52114319501245915516055106046884209969926127482827954674443846427813813222426"
+                token_id="72247127858101293756743562676945901963630969280187987932370111719068543181084"
             ),
         ]
     )
