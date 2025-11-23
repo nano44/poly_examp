@@ -1,17 +1,26 @@
 import asyncio
 import math
+import os
 import time
 from collections import deque
 
 import orjson
 import requests
 import websockets
+from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 
 # Targeting params
 MAX_SIZE = 10.0
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
 BINANCE_REF_PRICE = 0.0
+DRY_RUN_MODE = True
+client: ClobClient | None = None
+TOKEN_ID_UP = "10334449752454341374581636586903032507606859851381275260687240460182698532134"
+TOKEN_ID_DOWN = "52024715793975710673607861457473968911870695482055079725273269515884399987454"
 
 
 class MarketState:
@@ -113,26 +122,104 @@ async def market_data_listener(state: MarketState) -> None:
 
                     if vel > 25.0 and obi > 0.6:
                         print(
-                            f"🚨 BUY SIGNAL | Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
+                            f"🚨 BULL SIGNAL! Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
                         )
                         last_trigger_time = ts  # Reset Cooldown
-                        # TODO: place order here
+                        await execute_trade("BULL", size)
                     elif vel < -25.0 and obi < -0.6:
                         print(
-                            f"🚨 SELL SIGNAL | Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
+                            f"🚨 BEAR SIGNAL! Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
                         )
                         last_trigger_time = ts  # Reset Cooldown
-                        # TODO: place order here
+                        await execute_trade("BEAR", size)
         except Exception as e:
             print(f"MD connection error: {e} | reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
 
+async def execute_trade(signal_type, size: float) -> None:
+    if client is None:
+        print("❌ Client not initialized")
+        return
+
+    target_token_id = TOKEN_ID_UP if signal_type == "BULL" else TOKEN_ID_DOWN
+    side = BUY  # we always buy the respective token
+
+    # Step 1: Connectivity check (orderbook)
+    try:
+        ob = await asyncio.to_thread(client.get_order_book, target_token_id)
+    except Exception as e:
+        print(f"❌ ABORT: Failed to fetch orderbook: {e}")
+        return
+
+    # Step 2: Spread guard
+    try:
+        # Polymarket library returns lists of OrderSummary objects
+        best_bid = float(ob.bids[0].price) if ob.bids else 0.0
+        best_ask = float(ob.asks[0].price) if ob.asks else 0.0
+    except Exception:
+        print("❌ ABORT: Invalid orderbook data")
+        return
+
+    spread = best_ask - best_bid
+    if spread > 0.03:
+        print(f"❌ ABORT: Spread too wide ({spread:.4f})")
+        return
+
+    price = best_ask  # taking liquidity on chosen side
+    if DRY_RUN_MODE:
+        direction = "UP" if target_token_id == TOKEN_ID_UP else "DOWN"
+        print(
+            f"🔧 DRY RUN: Would have BOUGHT {direction} ({size:.2f} shares) @ ${price:.4f}"
+        )
+        return
+
+    try:
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side=side,
+            token_id=target_token_id,
+        )
+        signed = client.create_order(order_args)
+        resp = client.post_order(signed, OrderType.IOC)
+        direction = "UP" if target_token_id == TOKEN_ID_UP else "DOWN"
+        print(f"✅ Sent BUY {direction} | OrderID: {resp.get('orderID', resp)}")
+    except Exception as e:
+        print(f"❌ Order error: {e}")
+
+
 async def main() -> None:
-    global BINANCE_REF_PRICE
+    global BINANCE_REF_PRICE, client, TOKEN_ID_UP, TOKEN_ID_DOWN
+    load_dotenv()
     BINANCE_REF_PRICE = get_binance_candle_open()
     print(f"✅ Reference Price set to: ${BINANCE_REF_PRICE:,.2f}")
+
+    client = ClobClient(
+        os.getenv("CLOB_API_URL") or "https://clob.polymarket.com",
+        key=os.getenv("PK"),
+        chain_id=int(os.getenv("CHAIN_ID", "137")),
+        signature_type=int(os.getenv("SIGNATURE_TYPE", "1")),
+        funder=os.getenv("FUNDER"),
+        creds=None,
+    )
+    api_key = os.getenv("CLOB_API_KEY")
+    api_secret = os.getenv("CLOB_SECRET")
+    api_passphrase = os.getenv("CLOB_PASS_PHRASE")
+    if api_key and api_secret and api_passphrase:
+        from py_clob_client.clob_types import ApiCreds
+
+        client.set_api_creds(
+            ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+        )
+        print("✅ Polymarket client initialized with API creds")
+    else:
+        print("ℹ️ Polymarket client initialized without API creds (read-only)")
 
     state = MarketState(maxlen=20)
     await market_data_listener(state)
