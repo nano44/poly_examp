@@ -1,3 +1,4 @@
+import os
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BookParams
 
@@ -9,10 +10,10 @@ def main():
     resp = client.get_order_books(
         params=[
             BookParams(
-                token_id="71321045679252212594626385532706912750332728571942532289631379312455583992563"
+                token_id="44527960608459915204385410174103900772376741082547846811964179630682948263379"
             ),
             BookParams(
-                token_id="52114319501245915516055106046884209969926127482827954674443846427813813222426"
+                token_id="56297617931546527767294349494591959172101397323020328846651582318666139280906"
             ),
         ]
     )

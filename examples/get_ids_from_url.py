@@ -1,8 +1,12 @@
 import json
 import requests
+import time
 
-# PASTE YOUR URL HERE
-TARGET_URL = "https://polymarket.com/event/btc-updown-15m-1763918100?tid=1763918302937"
+# ==========================================
+# 1. PASTE YOUR NEW URL HERE (EVERY 15 MIN)
+# ==========================================
+TARGET_URL = "https://polymarket.com/event/btc-updown-15m-1764323100?tid=1764323111632"
+OUTPUT_FILE = "active_ids.json"
 
 
 def check_clob_status(token_id: str) -> bool:
@@ -19,7 +23,23 @@ def check_clob_status(token_id: str) -> bool:
         return False
 
 
-def fetch_ids_from_url():
+def save_ids(up_id, down_id, market_question):
+    """Saves the valid IDs to a JSON file for the bot to read."""
+    data = {
+        "UP": up_id,
+        "DOWN": down_id,
+        "market": market_question,
+        "updated_at": time.time(),
+        "source_url": TARGET_URL,
+    }
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+    print(f"\n💾 SUCCESS: Saved to {OUTPUT_FILE}")
+    print(f"   UP ID:   {up_id}")
+    print(f"   DOWN ID: {down_id}")
+
+
+def fetch_and_save_ids():
     try:
         # 1. Parse Slug
         if "event/" not in TARGET_URL:
@@ -37,14 +57,16 @@ def fetch_ids_from_url():
             return
 
         event = resp[0] if isinstance(resp, list) else resp
-        print(f"✅ Found Event: {event.get('title')}")
-
         markets = event.get("markets", [])
-        print(f"📊 Found {len(markets)} market(s) in this event.")
+        print(f"📊 Found {len(markets)} market(s). Scanning for active pairs...")
+
+        found_valid_pair = False
 
         for m in markets:
-            print(f"\n📌 Market: {m.get('question')}")
+            market_question = m.get("question")
+            print(f"\n📌 Checking: {market_question}")
 
+            # Get Token IDs
             clob_ids = m.get("clobTokenIds", [])
             if isinstance(clob_ids, str):
                 try:
@@ -56,30 +78,59 @@ def fetch_ids_from_url():
             if not clob_ids and tokens_meta:
                 clob_ids = [t.get("token_id") or t.get("id") for t in tokens_meta]
 
-            if not clob_ids:
-                print("   ❌ No Token IDs found for this market.")
+            if len(clob_ids) < 2:
+                print("   ❌ Not enough tokens.")
                 continue
 
-            print(f"   (Found {len(clob_ids)} tokens. Verifying status...)")
-            print("-" * 80)
+            # Identify UP vs DOWN (prefer labels; fallback to list order)
+            up_id = None
+            down_id = None
 
             for idx, token_id in enumerate(clob_ids):
                 if not token_id:
                     continue
-                outcome_label = "Unknown"
+
+                outcome = ""
                 if idx < len(tokens_meta):
-                    outcome_label = tokens_meta[idx].get("outcome", "Unknown")
+                    meta = tokens_meta[idx] or {}
+                    outcome = (
+                        meta.get("outcome")
+                        or meta.get("ticker")
+                        or meta.get("label")
+                        or ""
+                    ).upper()
 
-                is_active = check_clob_status(token_id)
-                status_label = "✅ ACTIVE" if is_active else "❌ DEAD (404)"
+                if outcome in ["UP", "YES"]:
+                    up_id = token_id
+                elif outcome in ["DOWN", "NO"]:
+                    down_id = token_id
 
-                print(f'Outcome: {outcome_label:<20} | ID: {token_id} | Status: {status_label}')
+            if len(clob_ids) >= 2:
+                up_id = up_id or clob_ids[0]
+                down_id = down_id or clob_ids[1]
 
-            print("-" * 80)
+            # Validate and Save
+            if up_id and down_id:
+                up_active = check_clob_status(up_id)
+                down_active = check_clob_status(down_id)
+                if up_active and down_active:
+                    print("   ✅ IDs are ACTIVE on CLOB.")
+                    save_ids(up_id, down_id, market_question)
+                    found_valid_pair = True
+                    return
+                print(
+                    "   ⚠️ IDs found, but CLOB returned 404 (Expired/Inactive). "
+                    f"UP active? {up_active} | DOWN active? {down_active}"
+                )
+            else:
+                print("   ❌ Could not identify UP/DOWN pair.")
+
+        if not found_valid_pair:
+            print("\n❌ Failed: No active UP/DOWN token pair found in this event.")
 
     except Exception as e:
         print(f"❌ Error: {e}")
 
 
 if __name__ == "__main__":
-    fetch_ids_from_url()
+    fetch_and_save_ids()

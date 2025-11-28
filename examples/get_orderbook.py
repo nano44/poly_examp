@@ -1,3 +1,4 @@
+import os
 from py_clob_client.client import ClobClient
 
 
@@ -6,7 +7,7 @@ def main():
     client = ClobClient(host)
 
     orderbook = client.get_order_book(
-        "71321045679252212594626385532706912750332728571942532289631379312455583992563"
+        "44527960608459915204385410174103900772376741082547846811964179630682948263379"
     )
     print("orderbook", orderbook)
 
