@@ -16,7 +16,7 @@ from py_clob_client.order_builder.constants import BUY
 load_dotenv()
 
 # Strategy + risk knobs
-MAX_SIZE = 10.0
+MAX_SIZE = 5.0
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
 VELOCITY_THRESHOLD = 25.0
@@ -240,11 +240,8 @@ async def execute_trade(signal: str, size: float) -> None:
 
     side_label = "UP" if signal.upper().startswith("BULL") or signal.upper() == "UP" else "DOWN"
     async with CACHE_LOCK:
-        up_entry = POLY_MARKET_CACHE["UP"].copy()
-        down_entry = POLY_MARKET_CACHE["DOWN"].copy()
-
-    target = up_entry if side_label == "UP" else down_entry
-    other = down_entry if side_label == "UP" else up_entry
+        target = POLY_MARKET_CACHE[side_label].copy()
+        other = POLY_MARKET_CACHE["DOWN" if side_label == "UP" else "UP"].copy()
 
     if NEEDS_NEW_IDS or not target["id"]:
         print("⚠️ Skipping trade: market IDs unresolved.")
@@ -259,39 +256,69 @@ async def execute_trade(signal: str, size: float) -> None:
         print(f"❌ Spread guard tripped ({target['spread']:.4f}); aborting.")
         return
 
-    if target["ask"] <= 0 or other["bid"] <= 0:
-        print("❌ Missing top-of-book data; aborting.")
-        return
-
-    parity = up_entry["ask"] + down_entry["bid"]
+    parity = target["ask"] + other["bid"]
     if abs(parity - 1.0) > FAIR_VALUE_EPS:
         print("❌ Parity check failed (UP ask + DOWN bid not ≈ 1).")
         return
 
     price = target["ask"]
+
+    # 🛑 JUNK FILTER: Don't buy "lottery tickets" (< 10 cents)
+    if price < 0.10:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too low (Lottery Ticket).")
+        return
+    
+    # 🛑 EXPENSIVE FILTER: Don't buy "sure things" (> 90 cents)
+    if price > 0.90:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too expensive.")
+        return
+
+    # 1. Round Price immediately to avoid float issues
+    price = float(f"{price:.2f}")
+    if price <= 0: price = 0.01
+
+    # 2. Dynamic Sizing Logic ($1.02 Minimum)
+    min_notional_value = 1.02
+    if price * size < min_notional_value:
+        old_size = size
+        # Calculate new size
+        raw_size = min_notional_value / price
+        # Format explicitly to 2 decimals via string to strip float garbage
+        size = float(f"{raw_size:.2f}")
+        print(f"⚖️  Adjusting Size: {old_size:.2f} -> {size:.2f} (to meet $1 min)")
+    else:
+        # Just format existing size
+        size = float(f"{size:.2f}")
+
     if DRY_RUN_MODE:
         print(
-            f"🔧 DRY RUN: BUY {side_label} {size:.2f} @ ${price:.4f} "
-            f"(spread {target['spread']:.4f})"
+            f"🔧 DRY RUN: BUY {side_label} {size:.2f} @ ${price:.2f} "
+            f"(Val: ${size*price:.2f})"
         )
         return
 
     try:
+        print(f"⏳ Sending BUY {side_label} {size:.2f} @ ${price:.2f}...")
+
         order_args = OrderArgs(
-            price=price,
-            size=size,
+            price=price,  # <--- Use 'price' directly (it is already clean)
+            size=size,    # <--- Use 'size' directly (it is already clean)
             side=BUY,
             token_id=target["id"],
         )
         signed_order = await asyncio.to_thread(client.create_order, order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
-        print(f"✅ Sent BUY {side_label} | OrderID: {order_id}")
+        
+        # Use 'size' and 'price' here too
+        print(
+            f"✅ Sent BUY {side_label} {size:.2f} @ ${price:.2f} | OrderID: {order_id}"
+        )
     except PolyApiException as e:
         if e.status_code == 404:
             NEEDS_NEW_IDS = True
         print(f"❌ Order error: {e}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"❌ Unexpected order error: {e}")
 
 
