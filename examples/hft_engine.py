@@ -16,7 +16,7 @@ from py_clob_client.order_builder.constants import BUY
 load_dotenv()
 
 # Strategy + risk knobs
-MAX_SIZE = 5.0
+MAX_SIZE = 2.0
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
 VELOCITY_THRESHOLD = 25.0
@@ -24,7 +24,7 @@ OBI_THRESHOLD = 0.6
 SPREAD_THRESHOLD = 0.03
 FAIR_VALUE_EPS = 0.02
 DATA_STALENESS_S = 2.0
-BOOK_REFRESH_S = 0.5
+BOOK_REFRESH_S = 0.2
 COOLDOWN_SECONDS = 5.0
 # SET TO FALSE TO TRADE REAL MONEY
 DRY_RUN_MODE = False
@@ -313,9 +313,41 @@ async def execute_trade(signal: str, size: float) -> None:
             f"✅ Sent BUY {side_label} {valid_size:.2f} @ ${price:.2f} | OrderID: {order_id}"
         )
     except PolyApiException as e:
-        if e.status_code == 404:
+        # Check if the error is specifically the "No Match" error
+        error_msg = str(e)
+        if "no orders found to match" in error_msg:
+            print(f"❌ REJECTED (No Match). Checking real price...")
+            
+            try:
+                # 1. Immediate "Forensic" Fetch (Blocking call to be fast)
+                # We ask the API: "Okay, if $0.66 wasn't good enough, what IS the price?"
+                audit_book = client.get_order_book(target["id"])
+                
+                # 2. Find the Real Best Ask
+                # Remember: API sorts 0.99 -> 0.01. We want the LAST item [-1].
+                if audit_book.asks:
+                    real_price = float(audit_book.asks[-1].price)
+                    gap = real_price - price
+                    
+                    print(f"🕵️ AUDIT: You bid ${price:.2f}. Real Ask is ${real_price:.2f}.")
+                    if gap > 0:
+                        print(f"📉 VERDICT: Latency. Market moved UP by ${gap:.2f} before you arrived.")
+                    elif gap == 0:
+                        print(f"👻 VERDICT: Ghost Liquidity. Price shows ${real_price:.2f} but it wasn't tradeable.")
+                    else:
+                        print(f"❓ VERDICT: Market moved DOWN (${gap:.2f})? This shouldn't happen on a Buy.")
+                else:
+                    print("🕵️ AUDIT: Book is empty (No Sellers).")
+                    
+            except Exception as audit_err:
+                print(f"⚠️ Audit failed: {audit_err}")
+
+        elif e.status_code == 404:
             NEEDS_NEW_IDS = True
-        print(f"❌ Order error: {e}")
+            print(f"❌ Order error: 404 Market Not Found")
+        else:
+            print(f"❌ Order error: {e}")
+
     except Exception as e:
         print(f"❌ Unexpected order error: {e}")
 
