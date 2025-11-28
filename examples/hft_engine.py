@@ -261,58 +261,56 @@ async def execute_trade(signal: str, size: float) -> None:
         print("❌ Parity check failed (UP ask + DOWN bid not ≈ 1).")
         return
 
-    price = target["ask"]
+    # 1. Clean Price
+    raw_price = target["ask"]
+    if raw_price <= 0:
+        raw_price = 0.01
+    price = float(f"{raw_price:.2f}")
 
-    # 🛑 JUNK FILTER: Don't buy "lottery tickets" (< 10 cents)
+    # 🛑 JUNK / EXPENSIVE FILTERS
     if price < 0.10:
-        print(f"⚠️ Skipping trade: Price ${price:.2f} is too low (Lottery Ticket).")
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too low.")
         return
-    
-    # 🛑 EXPENSIVE FILTER: Don't buy "sure things" (> 90 cents)
     if price > 0.90:
         print(f"⚠️ Skipping trade: Price ${price:.2f} is too expensive.")
         return
 
-    # 1. Round Price immediately to avoid float issues
-    price = float(f"{price:.2f}")
-    if price <= 0: price = 0.01
+    # 2. MATHEMATICAL SIZE FIX (clean maker amount)
+    price_cents = int(round(price * 100))
+    step_size_cents = 100 // math.gcd(price_cents, 100)
+    step_size = step_size_cents / 100.0
 
-    # 2. Dynamic Sizing Logic ($1.02 Minimum)
-    min_notional_value = 1.02
-    if price * size < min_notional_value:
-        old_size = size
-        # Calculate new size
-        raw_size = min_notional_value / price
-        # Format explicitly to 2 decimals via string to strip float garbage
-        size = float(f"{raw_size:.2f}")
-        print(f"⚖️  Adjusting Size: {old_size:.2f} -> {size:.2f} (to meet $1 min)")
-    else:
-        # Just format existing size
-        size = float(f"{size:.2f}")
+    min_notional = 1.10
+    raw_min_size = min_notional / price
+    target_size = max(size, raw_min_size)
+
+    valid_size = math.ceil(target_size / step_size) * step_size
+    valid_size = float(f"{valid_size:.2f}")
+
+    if valid_size != size:
+        print(f"⚖️  Adjusting Size: {size:.2f} -> {valid_size:.2f} (Math Alignment)")
 
     if DRY_RUN_MODE:
         print(
-            f"🔧 DRY RUN: BUY {side_label} {size:.2f} @ ${price:.2f} "
-            f"(Val: ${size*price:.2f})"
+            f"🔧 DRY RUN: BUY {side_label} {valid_size:.2f} @ ${price:.2f} "
+            f"(Val: ${valid_size*price:.2f})"
         )
         return
 
     try:
-        print(f"⏳ Sending BUY {side_label} {size:.2f} @ ${price:.2f}...")
+        print(f"⏳ Sending BUY {side_label} {valid_size:.2f} @ ${price:.2f}...")
 
         order_args = OrderArgs(
-            price=price,  # <--- Use 'price' directly (it is already clean)
-            size=size,    # <--- Use 'size' directly (it is already clean)
+            price=price,
+            size=valid_size,
             side=BUY,
             token_id=target["id"],
         )
         signed_order = await asyncio.to_thread(client.create_order, order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
-        
-        # Use 'size' and 'price' here too
         print(
-            f"✅ Sent BUY {side_label} {size:.2f} @ ${price:.2f} | OrderID: {order_id}"
+            f"✅ Sent BUY {side_label} {valid_size:.2f} @ ${price:.2f} | OrderID: {order_id}"
         )
     except PolyApiException as e:
         if e.status_code == 404:
