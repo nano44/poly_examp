@@ -16,7 +16,7 @@ from py_clob_client.order_builder.constants import BUY
 load_dotenv()
 
 # Strategy + risk knobs
-MAX_SIZE = 10.0
+MAX_SIZE = 5.0
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
 VELOCITY_THRESHOLD = 25.0
@@ -240,11 +240,8 @@ async def execute_trade(signal: str, size: float) -> None:
 
     side_label = "UP" if signal.upper().startswith("BULL") or signal.upper() == "UP" else "DOWN"
     async with CACHE_LOCK:
-        up_entry = POLY_MARKET_CACHE["UP"].copy()
-        down_entry = POLY_MARKET_CACHE["DOWN"].copy()
-
-    target = up_entry if side_label == "UP" else down_entry
-    other = down_entry if side_label == "UP" else up_entry
+        target = POLY_MARKET_CACHE[side_label].copy()
+        other = POLY_MARKET_CACHE["DOWN" if side_label == "UP" else "UP"].copy()
 
     if NEEDS_NEW_IDS or not target["id"]:
         print("⚠️ Skipping trade: market IDs unresolved.")
@@ -259,39 +256,67 @@ async def execute_trade(signal: str, size: float) -> None:
         print(f"❌ Spread guard tripped ({target['spread']:.4f}); aborting.")
         return
 
-    if target["ask"] <= 0 or other["bid"] <= 0:
-        print("❌ Missing top-of-book data; aborting.")
-        return
-
-    parity = up_entry["ask"] + down_entry["bid"]
+    parity = target["ask"] + other["bid"]
     if abs(parity - 1.0) > FAIR_VALUE_EPS:
         print("❌ Parity check failed (UP ask + DOWN bid not ≈ 1).")
         return
 
-    price = target["ask"]
+    # 1. Clean Price
+    raw_price = target["ask"]
+    if raw_price <= 0:
+        raw_price = 0.01
+    price = float(f"{raw_price:.2f}")
+
+    # 🛑 JUNK / EXPENSIVE FILTERS
+    if price < 0.10:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too low.")
+        return
+    if price > 0.90:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too expensive.")
+        return
+
+    # 2. MATHEMATICAL SIZE FIX (clean maker amount)
+    price_cents = int(round(price * 100))
+    step_size_cents = 100 // math.gcd(price_cents, 100)
+    step_size = step_size_cents / 100.0
+
+    min_notional = 1.10
+    raw_min_size = min_notional / price
+    target_size = max(size, raw_min_size)
+
+    valid_size = math.ceil(target_size / step_size) * step_size
+    valid_size = float(f"{valid_size:.2f}")
+
+    if valid_size != size:
+        print(f"⚖️  Adjusting Size: {size:.2f} -> {valid_size:.2f} (Math Alignment)")
+
     if DRY_RUN_MODE:
         print(
-            f"🔧 DRY RUN: BUY {side_label} {size:.2f} @ ${price:.4f} "
-            f"(spread {target['spread']:.4f})"
+            f"🔧 DRY RUN: BUY {side_label} {valid_size:.2f} @ ${price:.2f} "
+            f"(Val: ${valid_size*price:.2f})"
         )
         return
 
     try:
+        print(f"⏳ Sending BUY {side_label} {valid_size:.2f} @ ${price:.2f}...")
+
         order_args = OrderArgs(
             price=price,
-            size=size,
+            size=valid_size,
             side=BUY,
             token_id=target["id"],
         )
         signed_order = await asyncio.to_thread(client.create_order, order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
-        print(f"✅ Sent BUY {side_label} | OrderID: {order_id}")
+        print(
+            f"✅ Sent BUY {side_label} {valid_size:.2f} @ ${price:.2f} | OrderID: {order_id}"
+        )
     except PolyApiException as e:
         if e.status_code == 404:
             NEEDS_NEW_IDS = True
         print(f"❌ Order error: {e}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"❌ Unexpected order error: {e}")
 
 
