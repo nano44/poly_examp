@@ -1,5 +1,6 @@
 import asyncio
 import math
+import csv
 import os
 import time
 from collections import deque
@@ -16,10 +17,10 @@ from py_clob_client.order_builder.constants import BUY
 load_dotenv()
 
 # Strategy + risk knobs
-MAX_SIZE = 2.0
+MAX_SIZE = 1.5
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
-VELOCITY_THRESHOLD = 25.0
+VELOCITY_THRESHOLD = 50.0 # Increased to filter noise
 OBI_THRESHOLD = 0.6
 SPREAD_THRESHOLD = 0.03
 FAIR_VALUE_EPS = 0.02
@@ -31,6 +32,8 @@ DRY_RUN_MODE = False
 BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
 BINANCE_STREAM = os.getenv("BINANCE_STREAM", "btcusdt@bookTicker")
 BINANCE_REF_PRICE_OVERRIDE = os.getenv("BINANCE_REF_PRICE_OVERRIDE")
+TRACKED_TRADES: list[dict] = []
+CSV_FILE = "trade_analytics.csv"
 
 # Global shared state for ultra-low latency execution
 POLY_MARKET_CACHE = {
@@ -83,6 +86,16 @@ def calculate_size(price: float) -> float:
     dist = abs(price - BINANCE_REF_PRICE) if BINANCE_REF_PRICE else abs(price)
     size = MAX_SIZE * math.exp(-(dist**2) / (2 * SIZE_SIGMA**2))
     return max(MIN_SIZE, size)
+
+
+def init_csv() -> None:
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            # ✅ ADDED "Spread" to header
+            writer.writerow(
+                ["Timestamp", "Side", "Entry", "Spread", "Velocity", "Tick_1", "Tick_2", "Tick_3", "Tick_4", "Tick_5"]
+            )
 
 
 async def get_binance_candle_open(session: aiohttp.ClientSession) -> float:
@@ -211,7 +224,7 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
 
                 # Calculate Spread
                 if has_bids and has_asks:
-                    spread = best_ask - best_bid
+                    spread = round(best_ask - best_bid, 3)
                 else:
                     spread = 999.0
 
@@ -229,10 +242,30 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
                     }
                 )
 
+        # Post-trade tracking: capture 5 ticks after entry
+        for trade in TRACKED_TRADES.copy():
+            side = trade["side"]
+            if side not in POLY_MARKET_CACHE:
+                continue
+            current_price = POLY_MARKET_CACHE[side]["ask"]
+            trade["ticks"].append(current_price)
+            if len(trade["ticks"]) >= 5:
+                row = [
+                    trade["timestamp"],
+                    trade["side"],
+                    trade["entry"],
+                    trade.get("spread", 0.0),
+                    trade.get("velocity", 0.0),
+                ] + trade["ticks"][:5]
+                with open(CSV_FILE, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+                TRACKED_TRADES.remove(trade)
+
         await asyncio.sleep(BOOK_REFRESH_S)
 
 
-async def execute_trade(signal: str, size: float) -> None:
+async def execute_trade(signal: str, size: float, velocity: float | None = None) -> None:
     global NEEDS_NEW_IDS
     if client is None:
         print("❌ Client not initialized")
@@ -280,7 +313,7 @@ async def execute_trade(signal: str, size: float) -> None:
     step_size_cents = 100 // math.gcd(price_cents, 100)
     step_size = step_size_cents / 100.0
 
-    min_notional = 1.10
+    min_notional = 1.02
     raw_min_size = min_notional / price
     target_size = max(size, raw_min_size)
 
@@ -311,6 +344,16 @@ async def execute_trade(signal: str, size: float) -> None:
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(
             f"✅ Sent BUY {side_label} {valid_size:.2f} @ ${price:.2f} | OrderID: {order_id}"
+        )
+        TRACKED_TRADES.append(
+            {
+                "timestamp": time.time(),
+                "side": side_label,
+                "entry": price,
+                "spread": target["spread"],
+                "velocity": velocity if velocity is not None else 0.0,
+                "ticks": [],
+            }
         )
     except PolyApiException as e:
         # Check if the error is specifically the "No Match" error
@@ -381,6 +424,7 @@ async def market_data_listener(state: MarketState) -> None:
                         continue
 
                     vel = await state.velocity(window_s=1.0)
+                    vel = float(f"{vel:.1f}")
                     obi = calculate_obi(bid_qty, ask_qty)
                     size = calculate_size(mid)
 
@@ -389,13 +433,13 @@ async def market_data_listener(state: MarketState) -> None:
                             f"🚨 BULL SIGNAL! Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
                         )
                         last_trigger_time = ts
-                        await execute_trade("UP", size)
+                        await execute_trade("UP", size, vel)
                     elif vel < -VELOCITY_THRESHOLD and obi < -OBI_THRESHOLD:
                         print(
                             f"🚨 BEAR SIGNAL! Vel: {vel:.2f} | Size: {size:.2f} | OBI: {obi:.2f}"
                         )
                         last_trigger_time = ts
-                        await execute_trade("DOWN", size)
+                        await execute_trade("DOWN", size, vel)
         except Exception as e:  # noqa: BLE001
             print(f"MD connection error: {e} | reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
@@ -435,6 +479,8 @@ async def main() -> None:
         print("✅ Polymarket client initialized with API creds")
     else:
         print("ℹ️ Polymarket client initialized without API creds (read-only)")
+
+    init_csv()
 
     async with aiohttp.ClientSession(json_serialize=orjson.dumps) as session:
         BINANCE_REF_PRICE = await get_binance_candle_open(session)
