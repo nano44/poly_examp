@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(MANAGER_DIR)
 
 # Modules to run (Must match the filename without .py)
 FETCH_MODULE = "examples.get_autmatic_ids" 
-TRADE_MODULE = "examples.hft_engine"
+TRADE_MODULE = "examples.hft_engine_v2"
 PYTHON_CMD = sys.executable
 
 def run_id_fetcher():
