@@ -34,7 +34,7 @@ BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
 BINANCE_STREAM = os.getenv("BINANCE_STREAM", "btcusdt@bookTicker")
 BINANCE_REF_PRICE_OVERRIDE = os.getenv("BINANCE_REF_PRICE_OVERRIDE")
 TRACKED_TRADES: list[dict] = []
-CSV_FILE = "trade_analytics_v2.csv"
+CSV_FILE = "trade_analytics_temp.csv"
 TICKS_TO_CAPTURE = 8
 
 # Global shared state for ultra-low latency execution
@@ -96,7 +96,7 @@ def init_csv() -> None:
             writer = csv.writer(f)
             # ✅ ADDED "Spread" to header
             tick_headers = [f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)]
-            writer.writerow(["Timestamp", "Side", "Entry", "Spread", "Velocity"] + tick_headers)
+            writer.writerow(["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + tick_headers)
 
 
 async def get_binance_candle_open(session: aiohttp.ClientSession) -> float:
@@ -257,6 +257,7 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
                     trade["entry"],
                     trade.get("spread", 0.0),
                     trade.get("velocity", 0.0),
+                    trade.get("order_id"),
                 ] + trade["ticks"][:TICKS_TO_CAPTURE]
                 with open(CSV_FILE, "a", newline="") as f:
                     writer = csv.writer(f)
@@ -357,6 +358,7 @@ async def execute_trade(signal: str, size: float, velocity: float | None = None)
                 "entry": old_price,
                 "spread": target["spread"],
                 "velocity": velocity if velocity is not None else 0.0,
+                "order_id": order_id,
                 "ticks": [],
             }
         )
