@@ -314,8 +314,8 @@ def main():
                             enriched, remaining = enrich_helper_trades_with_csv(helper_trades, csv_rows)
                             if enriched:
                                 print(f"[Manager] 📄 Enriched {len(enriched)} trades with CSV data.")
-                                for item in enriched:
-                                    print(item)
+                                #for item in enriched:
+                                    #print(item)
                                 append_final_rows(enriched, FINAL_CSV_PATH)
                             if fieldnames:
                                 write_csv_rows(TRADE_CSV_PATH, fieldnames, remaining)

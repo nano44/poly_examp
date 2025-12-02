@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.constants import POLYGON
+from py_clob_client.clob_types import TradeParams
 
 # Load environment variables from .env file
 load_dotenv()
@@ -54,16 +55,29 @@ def get_authenticated_client() -> ClobClient:
 
 async def _get_recent_trades(limit: int = DEFAULT_TRADE_FETCH_LIMIT) -> list[dict]:
     """
-    Internal helper: fetches the most recent `limit` trades for the authenticated user.
+    Internal helper: fetches the most recent trades for the authenticated user.
     """
     if not USER_ADDRESS:
         raise RuntimeError("The 'FUNDER' environment variable is not set. Cannot determine user address.")
 
     client = get_authenticated_client()
-    trades = await asyncio.to_thread(client.get_trades)
+
+    # 2. Create the parameters object
+    # Note: We filter by maker_address to restrict to your user.
+    # If your version supports 'limit' or 'next_page' token, add it here.
+    # If 'limit' causes an error, remove it and filter manually after fetching.
+    params = TradeParams(
+        maker_address=USER_ADDRESS,
+        # limit=limit # Uncomment this if your version of TradeParams supports 'limit'
+    )
+
+    # 3. Pass the params object to get_trades
+    trades = await asyncio.to_thread(client.get_trades, params)
+    
+    # Slice locally in case the API returned more than requested
     return trades[:limit]
 
-
+    
 def _simplify_trade(trade: dict) -> dict:
     """
     Reduce a raw trade object to {order_id, price, size}.
