@@ -1,0 +1,528 @@
+import asyncio
+import math
+import csv
+import os
+import time
+from collections import deque
+import aiohttp
+import orjson
+import websockets
+from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, BookParams, OrderArgs, OrderType
+from py_clob_client.constants import POLYGON
+from py_clob_client.exceptions import PolyApiException
+from py_clob_client.order_builder.constants import BUY
+from examples.get_orderID import get_order_by_id
+
+load_dotenv()
+
+# Strategy + risk knobs
+MAX_SIZE = 1.5
+MIN_SIZE = 1.0
+SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
+VELOCITY_THRESHOLD = 1000.0 # Increased to filter noise
+VELOCITY_THRESHOLD_TOPCAP = 2500
+SIGNAL_THRESHOLD = 50.0
+#OBI_THRESHOLD = 0.6
+SPREAD_THRESHOLD = 0.03
+FAIR_VALUE_EPS = 0.02
+DATA_STALENESS_S = 2.0
+BOOK_REFRESH_S = 0.2
+COOLDOWN_SECONDS = 5.0
+# SET TO FALSE TO TRADE REAL MONEY
+DRY_RUN_MODE = False
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
+BINANCE_STREAM = os.getenv("BINANCE_STREAM", "btcusdt@bookTicker")
+BINANCE_REF_PRICE_OVERRIDE = os.getenv("BINANCE_REF_PRICE_OVERRIDE")
+TRACKED_TRADES: list[dict] = []
+CSV_FILE = "trade_analytics_temp.csv"
+TICKS_TO_CAPTURE = 8
+
+# Global shared state for ultra-low latency execution
+POLY_MARKET_CACHE = {
+    "UP": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
+    "DOWN": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
+}
+NEEDS_NEW_IDS = False
+CACHE_LOCK = asyncio.Lock()
+client: ClobClient | None = None
+BINANCE_REF_PRICE = 0.0
+
+
+class MarketState:
+    """Keeps a small sliding window of mid-prices to measure velocity."""
+
+    def __init__(self, maxlen: int = 40) -> None:
+        self._prices = deque(maxlen=maxlen)  # (timestamp, price)
+        self._lock = asyncio.Lock()
+
+    async def update(self, price: float, ts: float) -> None:
+        async with self._lock:
+            self._prices.append((ts, price))
+
+    async def velocity(self, window_s: float = 0.3) -> float:
+        async with self._lock:
+            if len(self._prices) < 2:
+                return 0.0
+            now = self._prices[-1][0]
+            oldest_t, oldest_p = self._prices[0]
+            for t, p in reversed(self._prices):
+                if now - t <= window_s:
+                    oldest_t, oldest_p = t, p
+                else:
+                    break
+            newest_t, newest_p = self._prices[-1]
+            dt = newest_t - oldest_t
+            if dt <= 0:
+                return 0.0
+            return (newest_p - oldest_p) / dt
+
+
+
+
+def calculate_size(price: float) -> float:
+    dist = abs(price - BINANCE_REF_PRICE) if BINANCE_REF_PRICE else abs(price)
+    size = MAX_SIZE * math.exp(-(dist**2) / (2 * SIZE_SIGMA**2))
+    return max(MIN_SIZE, size)
+
+
+def init_csv() -> None:
+    expected_header = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + [
+        f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)
+    ]
+    needs_header = not os.path.exists(CSV_FILE)
+    existing_rows: list[list[str]] = []
+
+    if not needs_header:
+        try:
+            with open(CSV_FILE, newline="") as f:
+                reader = csv.reader(f)
+                try:
+                    first = next(reader)
+                except StopIteration:
+                    needs_header = True
+                else:
+                    if first != expected_header:
+                        needs_header = True
+                        existing_rows = [first] + list(reader)
+        except OSError:
+            needs_header = True
+
+    if needs_header:
+        with open(CSV_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(expected_header)
+            if existing_rows:
+                writer.writerows(existing_rows)
+
+
+async def get_binance_candle_open(session: aiohttp.ClientSession) -> float:
+    """
+    Async fetch of the latest 15m candle open price for sizing calibration.
+    Retries with backoff until successful.
+    """
+    if BINANCE_REF_PRICE_OVERRIDE:
+        print("ℹ️ Using BINANCE_REF_PRICE_OVERRIDE from env.")
+        return float(BINANCE_REF_PRICE_OVERRIDE)
+
+    url = (
+        f"https://api.binance.com/api/v3/klines"
+        f"?symbol={BINANCE_SYMBOL}&interval=15m&limit=1"
+    )
+    print("⏳ Fetching Binance reference price...")
+    start_time = time.time()
+    backoff = 1
+    while True:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                resp.raise_for_status()
+                data = await resp.json(loads=orjson.loads)
+                if data and isinstance(data, list):
+                    return float(data[0][1])
+        except Exception as e:  # noqa: BLE001 - keep retrying loudly
+            print(f"⚠️ Failed to fetch reference price: {e}. Retrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10)
+        if time.time() - start_time > 60:
+            print("⚠️ Unable to fetch Binance reference price after 60s. Using 0.0.")
+            return 0.0
+
+
+async def refresh_market_ids() -> bool:
+    """
+    Reads IDs from active_ids.json (generated by your helper script).
+    """
+    global NEEDS_NEW_IDS
+
+    file_path = "active_ids.json"
+
+    if not os.path.exists(file_path):
+        print(f"⏳ Waiting for {file_path}...")
+        return False
+
+    try:
+        with open(file_path, "r") as f:
+            data = orjson.loads(f.read())
+
+        up_id = data.get("UP")
+        down_id = data.get("DOWN")
+
+        if not up_id or not down_id:
+            return False
+
+        async with CACHE_LOCK:
+            if POLY_MARKET_CACHE["UP"]["id"] != up_id:
+                print(f"🔄 LOADED NEW MARKET: {data.get('market', 'Unknown')}")
+                print(f"   UP: {up_id} | DOWN: {down_id}")
+
+                POLY_MARKET_CACHE["UP"] = {"id": up_id, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0}
+                POLY_MARKET_CACHE["DOWN"] = {"id": down_id, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0}
+
+        NEEDS_NEW_IDS = False
+        return True
+
+    except Exception as e:
+        print(f"❌ Error reading JSON: {e}")
+        return False
+
+
+def cache_has_ids() -> bool:
+    return bool(POLY_MARKET_CACHE["UP"]["id"] and POLY_MARKET_CACHE["DOWN"]["id"])
+
+
+def resolve_side_for_token(token_id: str) -> str | None:
+    for label, entry in POLY_MARKET_CACHE.items():
+        if entry["id"] == token_id:
+            return label
+    return None
+
+
+async def polymarket_data_stream(poly_client: ClobClient) -> None:
+    """
+    Corrected Stream: Reads from the TAIL of the order book arrays
+    because the API returns them sorted Worst-to-Best.
+    """
+    global NEEDS_NEW_IDS
+    while True:
+        if poly_client is None:
+            await asyncio.sleep(1)
+            continue
+
+        if NEEDS_NEW_IDS or not cache_has_ids():
+            await refresh_market_ids()
+            await asyncio.sleep(1)
+            continue
+
+        try:
+            params = [
+                BookParams(token_id=POLY_MARKET_CACHE["UP"]["id"]),
+                BookParams(token_id=POLY_MARKET_CACHE["DOWN"]["id"]),
+            ]
+            books = await asyncio.to_thread(poly_client.get_order_books, params)
+        except Exception:
+            await asyncio.sleep(BOOK_REFRESH_S)
+            continue
+
+        now = time.time()
+
+        async with CACHE_LOCK:
+            for book in books:
+                label = resolve_side_for_token(book.asset_id)
+                if not label:
+                    continue
+
+                has_bids = len(book.bids) > 0
+                has_asks = len(book.asks) > 0
+
+                # Bids are sorted 0.01 -> higher. We want the LAST one (Highest).
+                best_bid = float(book.bids[-1].price) if has_bids else 0.0
+
+                # Asks are sorted 0.99 -> lower. We want the LAST one (Lowest).
+                best_ask = float(book.asks[-1].price) if has_asks else 0.0
+
+                # Calculate Spread
+                if has_bids and has_asks:
+                    spread = round(best_ask - best_bid, 3)
+                else:
+                    spread = 999.0
+
+                # Sanity Check: If spread is negative (crossed book), assume tradeable at ask
+                if spread < 0:
+                    spread = 0.0
+
+                POLY_MARKET_CACHE[label].update(
+                    {
+                        "id": book.asset_id,
+                        "bid": best_bid,
+                        "ask": best_ask,
+                        "spread": spread,
+                        "last_updated": now,
+                    }
+                )
+
+        # Post-trade tracking: capture a rolling window of ticks after entry
+        for trade in TRACKED_TRADES.copy():
+            side = trade["side"]
+            if side not in POLY_MARKET_CACHE:
+                continue
+            current_price = POLY_MARKET_CACHE[side]["ask"]
+            trade["ticks"].append(current_price)
+            if len(trade["ticks"]) >= TICKS_TO_CAPTURE:
+                row = [
+                    trade["timestamp"],
+                    trade["side"],
+                    trade["entry"],
+                    trade.get("spread", 0.0),
+                    trade.get("velocity", 0.0),
+                    trade.get("order_id"),
+                ] + trade["ticks"][:TICKS_TO_CAPTURE]
+                with open(CSV_FILE, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+                TRACKED_TRADES.remove(trade)
+
+        await asyncio.sleep(BOOK_REFRESH_S)
+
+
+async def execute_trade(signal: str, size: float, velocity: float | None = None) -> None:
+    global NEEDS_NEW_IDS
+    if client is None:
+        print("❌ Client not initialized")
+        return
+
+    side_label = "UP" if signal.upper().startswith("BULL") or signal.upper() == "UP" else "DOWN"
+    async with CACHE_LOCK:
+        target = POLY_MARKET_CACHE[side_label].copy()
+        other = POLY_MARKET_CACHE["DOWN" if side_label == "UP" else "UP"].copy()
+
+    if NEEDS_NEW_IDS or not target["id"]:
+        print("⚠️ Skipping trade: market IDs unresolved.")
+        return
+
+    now = time.time()
+    if now - target["last_updated"] >= DATA_STALENESS_S:
+        print("❌ Stale Polymarket book; no trade sent.")
+        return
+
+    if target["spread"] >= SPREAD_THRESHOLD:
+        print(f"❌ Spread guard tripped ({target['spread']:.4f}); aborting.")
+        return
+
+    parity = target["ask"] + other["bid"]
+    if abs(parity - 1.0) > FAIR_VALUE_EPS:
+        print("❌ Parity check failed (UP ask + DOWN bid not ≈ 1).")
+        return
+
+    # 1. Clean Price
+    raw_price = target["ask"]
+    if raw_price <= 0:
+        raw_price = 0.01
+    price = float(f"{raw_price:.2f}")
+
+    # 🛑 JUNK / EXPENSIVE FILTERS
+    if price < 0.15:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too low.")
+        return
+    if price > 0.85:
+        print(f"⚠️ Skipping trade: Price ${price:.2f} is too expensive.")
+        return
+
+
+    #manual set
+    old_price = price
+    price = 0.90
+    # 2. MATHEMATICAL SIZE FIX (clean maker amount)
+    price_cents = int(round(price * 100))
+    step_size_cents = 100 // math.gcd(price_cents, 100)
+    step_size = step_size_cents / 100.0
+
+    min_notional = 1.02
+    raw_min_size = min_notional / price
+    target_size = max(size, raw_min_size)
+
+    valid_size = math.ceil(target_size / step_size) * step_size
+    valid_size = float(f"{valid_size:.2f}")
+
+    if valid_size != size:
+        print(f"⚖️  Adjusting Size: {size:.2f} -> {valid_size:.2f} (Math Alignment)")
+
+    if DRY_RUN_MODE:
+        print(
+            f"🔧 DRY RUN: BUY {side_label} {valid_size:.2f} @ ${price:.2f} "
+            f"(Val: ${valid_size*price:.2f})"
+        )
+        return
+
+    try:
+        print(f"⏳ Sending BUY {side_label} {valid_size:.2f} @ ${price:.2f}...")
+
+        order_args = OrderArgs(
+            price=price,
+            size=valid_size,
+            side=BUY,
+            token_id=target["id"],
+        )
+        before_singing = time.time()
+        signed_order = await asyncio.to_thread(client.create_order, order_args)
+        after_signing = time.time()
+        print(f"   🕒 Signing took {after_signing - before_singing:.4f}")
+        resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
+        order_id = resp.get("orderID") if isinstance(resp, dict) else resp
+        print(
+            f"✅ Sent BUY {side_label} {valid_size:.2f} @ ${price:.2f} | OrderID: {order_id}"
+        )
+        TRACKED_TRADES.append(
+            {
+                "timestamp": time.time(),
+                "side": side_label,
+                "entry": old_price,
+                "spread": target["spread"],
+                "velocity": velocity if velocity is not None else 0.0,
+                "order_id": order_id,
+                "ticks": [],
+            }
+        )
+    except PolyApiException as e:
+        # Check if the error is specifically the "No Match" error
+        error_msg = str(e)
+        if "no orders found to match" in error_msg:
+            print(f"❌ REJECTED (No Match). Checking real price...")
+            
+            try:
+                # 1. Immediate "Forensic" Fetch (Blocking call to be fast)
+                # We ask the API: "Okay, if $0.66 wasn't good enough, what IS the price?"
+                audit_book = client.get_order_book(target["id"])
+                
+                # 2. Find the Real Best Ask
+                # Remember: API sorts 0.99 -> 0.01. We want the LAST item [-1].
+                if audit_book.asks:
+                    real_price = float(audit_book.asks[-1].price)
+                    gap = real_price - price
+                    
+                    print(f"🕵️ AUDIT: You bid ${price:.2f}. Real Ask is ${real_price:.2f}.")
+                    if gap > 0:
+                        print(f"📉 VERDICT: Latency. Market moved UP by ${gap:.2f} before you arrived.")
+                    elif gap == 0:
+                        print(f"👻 VERDICT: Ghost Liquidity. Price shows ${real_price:.2f} but it wasn't tradeable.")
+                    else:
+                        print(f"❓ VERDICT: Market moved DOWN (${gap:.2f})? This shouldn't happen on a Buy.")
+                else:
+                    print("🕵️ AUDIT: Book is empty (No Sellers).")
+                    
+            except Exception as audit_err:
+                print(f"⚠️ Audit failed: {audit_err}")
+
+        elif e.status_code == 404:
+            NEEDS_NEW_IDS = True
+            print(f"❌ Order error: 404 Market Not Found")
+        else:
+            print(f"❌ Order error: {e}")
+
+    except Exception as e:
+        print(f"❌ Unexpected order error: {e}")
+
+
+async def market_data_listener(state: MarketState) -> None:
+    url = f"wss://stream.binance.com/ws/{BINANCE_STREAM}"
+    backoff = 1
+    last_trigger_time = 0.0
+
+    while True:
+        try:
+            async with websockets.connect(
+                url,
+                ping_interval=15,
+                ping_timeout=15,
+                max_queue=1,
+            ) as ws:
+                backoff = 1
+                print("⚡ Connected to Binance...")
+                async for msg in ws:
+                    data = orjson.loads(msg)
+                    bid = float(data["b"])
+                    ask = float(data["a"])
+                    bid_qty = float(data["B"])
+                    ask_qty = float(data["A"])
+                    mid = (bid + ask) / 2.0
+                    ts = time.time()
+                    await state.update(mid, ts)
+
+                    if ts - last_trigger_time < COOLDOWN_SECONDS or NEEDS_NEW_IDS:
+                        continue
+
+                    vel = await state.velocity(window_s=0.3)
+                    vel = float(f"{vel:.1f}")
+                    #obi = calculate_obi(bid_qty, ask_qty)
+                    size = calculate_size(mid)
+
+                    if vel > VELOCITY_THRESHOLD and vel < VELOCITY_THRESHOLD_TOPCAP : #and obi > OBI_THRESHOLD:
+                        print(
+                            f"🚨 BULL SIGNAL! Vel: {vel:.2f} | Size: {size:.2f}"
+                        )
+                        last_trigger_time = ts
+                        await execute_trade("UP", size, vel)
+                    elif vel < -VELOCITY_THRESHOLD and vel > -VELOCITY_THRESHOLD_TOPCAP: #and obi < -OBI_THRESHOLD:
+                        print(
+                            f"🚨 BEAR SIGNAL! Vel: {vel:.2f} | Size: {size:.2f}"
+                        )
+                        last_trigger_time = ts
+                        await execute_trade("DOWN", size, vel)
+        except Exception as e:  # noqa: BLE001
+            print(f"MD connection error: {e} | reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+async def main() -> None:
+    global BINANCE_REF_PRICE, client
+
+    host = os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
+    key = os.getenv("PK")
+    sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
+    funder = os.getenv("FUNDER")
+    chain_id = int(os.getenv("CHAIN_ID", str(POLYGON)))
+
+    creds = None
+    api_key = os.getenv("CLOB_API_KEY")
+    api_secret = os.getenv("CLOB_SECRET")
+    api_passphrase = os.getenv("CLOB_PASS_PHRASE")
+    if api_key and api_secret and api_passphrase:
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+
+    client = ClobClient(
+        host,
+        key=key,
+        chain_id=chain_id,
+        signature_type=sig_type,
+        funder=funder,
+        creds=creds,
+    )
+
+    if creds:
+        print("✅ Polymarket client initialized with API creds")
+    else:
+        print("ℹ️ Polymarket client initialized without API creds (read-only)")
+
+    init_csv()
+
+    async with aiohttp.ClientSession(json_serialize=orjson.dumps) as session:
+        BINANCE_REF_PRICE = await get_binance_candle_open(session)
+        print(f"✅ Reference Price set to: ${BINANCE_REF_PRICE:,.2f}")
+
+    await refresh_market_ids()
+
+    state = MarketState(maxlen=40)
+    asyncio.create_task(polymarket_data_stream(client))
+    await market_data_listener(state)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

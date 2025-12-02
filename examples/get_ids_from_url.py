@@ -5,7 +5,7 @@ import time
 # ==========================================
 # 1. PASTE YOUR NEW URL HERE (EVERY 15 MIN)
 # ==========================================
-TARGET_URL = "https://polymarket.com/event/btc-updown-15m-1764365400?tid=1764365115149"
+TARGET_URL = "https://polymarket.com/event/btc-updown-15m-1764603000?tid=1764603141140"
 OUTPUT_FILE = "active_ids.json"
 
 
