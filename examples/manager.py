@@ -25,7 +25,42 @@ LAST_TRADES_LIMIT = int(LAST_TRADES_LIMIT_RAW) if LAST_TRADES_LIMIT_RAW and LAST
 TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_temp.csv"))
 FINAL_CSV_PATH = os.getenv("TRADE_CSV_FINAL_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_final.csv"))
 TICK_COLUMNS = [f"Tick_{i}" for i in range(1, 9)]
+TEMP_HEADER = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + TICK_COLUMNS
 PYTHON_CMD = sys.executable
+
+
+def ensure_header_row(path: str, header: list[str]) -> None:
+    """
+    Ensure the CSV at `path` has the provided header.
+    If missing/empty or different header, rewrite with header and keep existing rows.
+    """
+    needs_header = not os.path.exists(path)
+    existing_rows: list[list[str]] = []
+
+    if not needs_header:
+        try:
+            with open(path, newline="") as f:
+                reader = csv.reader(f)
+                try:
+                    first = next(reader)
+                except StopIteration:
+                    needs_header = True
+                else:
+                    if first != header:
+                        needs_header = True
+                        existing_rows = [first] + list(reader)
+        except Exception:
+            needs_header = True
+
+    if needs_header:
+        try:
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                if existing_rows:
+                    writer.writerows(existing_rows)
+        except Exception as e:
+            print(f"[Manager] ⚠️ Could not ensure header for {path}: {e}")
 
 def run_id_fetcher():
     """Runs the ID fetcher as a module."""
@@ -88,8 +123,7 @@ def load_order_ids_from_csv(csv_path: str, max_ids: int | None = None) -> list[s
     Read OrderID values from the trade CSV.
     Returns most-recent unique order ids (preserves order).
     """
-    if not os.path.exists(csv_path):
-        return []
+    ensure_header_row(csv_path, TEMP_HEADER)
 
     order_ids: list[str] = []
     try:
@@ -120,6 +154,7 @@ def load_order_ids_from_csv(csv_path: str, max_ids: int | None = None) -> list[s
 
 
 def load_csv_rows(csv_path: str) -> tuple[list[dict], list[str]]:
+    ensure_header_row(csv_path, TEMP_HEADER)
     if not os.path.exists(csv_path):
         return [], []
     try:
@@ -209,18 +244,27 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
     if not rows:
         return
 
-    fieldnames = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID", "Price", "Size"] + TICK_COLUMNS
-    file_exists = os.path.exists(path)
+    fieldnames = [
+        "Timestamp",
+        "Side",
+        "Thought entry price",
+        "Actual entry price",
+        "Spread",
+        "Velocity",
+        "OrderID",
+        "Size",
+    ] + TICK_COLUMNS
+    ensure_header_row(path, fieldnames)
 
     def _map_row(r: dict) -> dict:
         mapped = {
             "Timestamp": r.get("timestamp") or r.get("Timestamp"),
             "Side": r.get("side") or r.get("Side"),
-            "Entry": r.get("entry") or r.get("Entry"),
+            "Thought entry price": r.get("entry") or r.get("Entry"),
             "Spread": r.get("spread") or r.get("Spread"),
             "Velocity": r.get("velocity") or r.get("Velocity"),
             "OrderID": r.get("order_id") or r.get("OrderID"),
-            "Price": r.get("price") or r.get("Price"),
+            "Actual entry price": r.get("price") or r.get("Price"),
             "Size": r.get("size") or r.get("Size"),
         }
         for tick in TICK_COLUMNS:
@@ -230,8 +274,6 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
     try:
         with open(path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
             writer.writerows(_map_row(r) for r in rows)
     except Exception as e:
         print(f"[Manager] ⚠️ Could not append to {path}: {e}")

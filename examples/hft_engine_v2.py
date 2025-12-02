@@ -21,7 +21,7 @@ load_dotenv()
 MAX_SIZE = 1.5
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
-VELOCITY_THRESHOLD = 600.0 # Increased to filter noise
+VELOCITY_THRESHOLD = 1000.0 # Increased to filter noise
 #OBI_THRESHOLD = 0.6
 SPREAD_THRESHOLD = 0.03
 FAIR_VALUE_EPS = 0.02
@@ -91,12 +91,33 @@ def calculate_size(price: float) -> float:
 
 
 def init_csv() -> None:
-    if not os.path.exists(CSV_FILE):
+    expected_header = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + [
+        f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)
+    ]
+    needs_header = not os.path.exists(CSV_FILE)
+    existing_rows: list[list[str]] = []
+
+    if not needs_header:
+        try:
+            with open(CSV_FILE, newline="") as f:
+                reader = csv.reader(f)
+                try:
+                    first = next(reader)
+                except StopIteration:
+                    needs_header = True
+                else:
+                    if first != expected_header:
+                        needs_header = True
+                        existing_rows = [first] + list(reader)
+        except OSError:
+            needs_header = True
+
+    if needs_header:
         with open(CSV_FILE, "w", newline="") as f:
             writer = csv.writer(f)
-            # ✅ ADDED "Spread" to header
-            tick_headers = [f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)]
-            writer.writerow(["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + tick_headers)
+            writer.writerow(expected_header)
+            if existing_rows:
+                writer.writerows(existing_rows)
 
 
 async def get_binance_candle_open(session: aiohttp.ClientSession) -> float:
@@ -303,10 +324,10 @@ async def execute_trade(signal: str, size: float, velocity: float | None = None)
     price = float(f"{raw_price:.2f}")
 
     # 🛑 JUNK / EXPENSIVE FILTERS
-    if price < 0.10:
+    if price < 0.15:
         print(f"⚠️ Skipping trade: Price ${price:.2f} is too low.")
         return
-    if price > 0.90:
+    if price > 0.85:
         print(f"⚠️ Skipping trade: Price ${price:.2f} is too expensive.")
         return
 
