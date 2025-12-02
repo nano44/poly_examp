@@ -23,6 +23,8 @@ LAST_TRADES_LIMIT_RAW = os.getenv("LAST_TRADES_LIMIT")
 LAST_TRADES_LIMIT = int(LAST_TRADES_LIMIT_RAW) if LAST_TRADES_LIMIT_RAW and LAST_TRADES_LIMIT_RAW.isdigit() else None
 # CSV that hft_engine_v2 writes executed trades to; only OrderID is read.
 TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_temp.csv"))
+FINAL_CSV_PATH = os.getenv("TRADE_CSV_FINAL_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_final.csv"))
+TICK_COLUMNS = [f"Tick_{i}" for i in range(1, 9)]
 PYTHON_CMD = sys.executable
 
 def run_id_fetcher():
@@ -52,9 +54,9 @@ def start_trader():
     )
 
 def run_last_trades(order_ids: list[str], limit: int | None = None) -> None:
-    """Runs the last-trades helper if order IDs are provided."""
+    """Runs the last-trades helper if order IDs are provided. Returns parsed trades."""
     if not order_ids:
-        return
+        return [], ""
 
     cmd = [PYTHON_CMD, "-m", LAST_TRADES_MODULE, "--order-ids", *order_ids]
     if limit:
@@ -73,9 +75,12 @@ def run_last_trades(order_ids: list[str], limit: int | None = None) -> None:
             print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="")
+        parsed = parse_helper_output(result.stdout)
+        return parsed, result.stdout
     except subprocess.CalledProcessError as e:
         print(f"[Manager] ❌ Last-trades helper failed: {e}")
         print(e.stderr)
+        return [], ""
 
 
 def load_order_ids_from_csv(csv_path: str, max_ids: int | None = None) -> list[str]:
@@ -112,6 +117,124 @@ def load_order_ids_from_csv(csv_path: str, max_ids: int | None = None) -> list[s
             break
 
     return list(reversed(deduped))
+
+
+def load_csv_rows(csv_path: str) -> tuple[list[dict], list[str]]:
+    if not os.path.exists(csv_path):
+        return [], []
+    try:
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            return rows, reader.fieldnames or []
+    except Exception as e:
+        print(f"[Manager] ⚠️ Could not read rows from {csv_path}: {e}")
+        return [], []
+
+
+def write_csv_rows(csv_path: str, fieldnames: list[str], rows: list[dict]) -> None:
+    if not fieldnames:
+        return
+    try:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        print(f"[Manager] ⚠️ Could not write rows to {csv_path}: {e}")
+
+
+def parse_helper_output(output: str) -> list[dict]:
+    """Parse helper stdout lines into structured trades."""
+    trades: list[dict] = []
+    for line in output.splitlines():
+        if not line.startswith("Order ID:"):
+            continue
+        try:
+            parts = [p.strip() for p in line.split("|")]
+            oid = parts[0].split("Order ID:")[1].strip()
+            price_part = parts[1].split("Price:")[1].strip()
+            size_part = parts[2].split("Size:")[1].strip()
+            trades.append(
+                {
+                    "order_id": oid,
+                    "price": float(price_part),
+                    "size": float(size_part),
+                }
+            )
+        except Exception:
+            continue
+    return trades
+
+
+def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Combine helper trades with matching CSV rows.
+    Returns (enriched_trades, remaining_csv_rows) where matched rows are removed.
+    """
+    remaining = list(csv_rows)
+    enriched: list[dict] = []
+
+    for ht in helper_trades:
+        oid = ht.get("order_id")
+        if not oid:
+            continue
+        match_index = next(
+            (i for i, r in enumerate(remaining) if (r.get("OrderID") or "").strip() == oid),
+            None,
+        )
+        if match_index is None:
+            continue
+        row = remaining.pop(match_index)
+        combined = {
+            "order_id": oid,
+            "price": ht.get("price"),
+            "size": ht.get("size"),
+            "timestamp": row.get("Timestamp"),
+            "side": row.get("Side"),
+            "entry": row.get("Entry"),
+            "spread": row.get("Spread"),
+            "velocity": row.get("Velocity"),
+        }
+        for key, val in row.items():
+            if key.startswith("Tick_"):
+                combined[key] = val
+        enriched.append(combined)
+
+    return enriched, remaining
+
+
+def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
+    """Append enriched rows to the final CSV."""
+    if not rows:
+        return
+
+    fieldnames = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID", "Price", "Size"] + TICK_COLUMNS
+    file_exists = os.path.exists(path)
+
+    def _map_row(r: dict) -> dict:
+        mapped = {
+            "Timestamp": r.get("timestamp") or r.get("Timestamp"),
+            "Side": r.get("side") or r.get("Side"),
+            "Entry": r.get("entry") or r.get("Entry"),
+            "Spread": r.get("spread") or r.get("Spread"),
+            "Velocity": r.get("velocity") or r.get("Velocity"),
+            "OrderID": r.get("order_id") or r.get("OrderID"),
+            "Price": r.get("price") or r.get("Price"),
+            "Size": r.get("size") or r.get("Size"),
+        }
+        for tick in TICK_COLUMNS:
+            mapped[tick] = r.get(tick)
+        return mapped
+
+    try:
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(_map_row(r) for r in rows)
+    except Exception as e:
+        print(f"[Manager] ⚠️ Could not append to {path}: {e}")
 
 def stop_trader(process):
     """Gracefully stops the trading bot."""
@@ -185,7 +308,17 @@ def main():
                 if now_ts - last_trades_poll_ts >= 60:
                     poll_order_ids = collect_order_ids()
                     if poll_order_ids:
-                        run_last_trades(poll_order_ids, LAST_TRADES_LIMIT)
+                        helper_trades, _ = run_last_trades(poll_order_ids, LAST_TRADES_LIMIT)
+                        if helper_trades:
+                            csv_rows, fieldnames = load_csv_rows(TRADE_CSV_PATH)
+                            enriched, remaining = enrich_helper_trades_with_csv(helper_trades, csv_rows)
+                            if enriched:
+                                print(f"[Manager] 📄 Enriched {len(enriched)} trades with CSV data.")
+                                for item in enriched:
+                                    print(item)
+                                append_final_rows(enriched, FINAL_CSV_PATH)
+                            if fieldnames:
+                                write_csv_rows(TRADE_CSV_PATH, fieldnames, remaining)
                     last_trades_poll_ts = now_ts
 
                 time.sleep(1)
