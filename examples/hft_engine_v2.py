@@ -22,6 +22,8 @@ MAX_SIZE = 1.5
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  # standard deviation for Gaussian decay
 VELOCITY_THRESHOLD = 1000.0 # Increased to filter noise
+VELOCITY_THRESHOLD_TOPCAP = 2500
+SIGNAL_THRESHOLD = 50.0
 #OBI_THRESHOLD = 0.6
 SPREAD_THRESHOLD = 0.03
 FAIR_VALUE_EPS = 0.02
@@ -51,7 +53,7 @@ BINANCE_REF_PRICE = 0.0
 class MarketState:
     """Keeps a small sliding window of mid-prices to measure velocity."""
 
-    def __init__(self, maxlen: int = 20) -> None:
+    def __init__(self, maxlen: int = 40) -> None:
         self._prices = deque(maxlen=maxlen)  # (timestamp, price)
         self._lock = asyncio.Lock()
 
@@ -59,7 +61,7 @@ class MarketState:
         async with self._lock:
             self._prices.append((ts, price))
 
-    async def velocity(self, window_s: float = 1.0) -> float:
+    async def velocity(self, window_s: float = 0.3) -> float:
         async with self._lock:
             if len(self._prices) < 2:
                 return 0.0
@@ -77,11 +79,6 @@ class MarketState:
             return (newest_p - oldest_p) / dt
 
 
-"""def calculate_obi(bid_qty: float, ask_qty: float) -> float:
-    denom = bid_qty + ask_qty
-    if denom == 0:
-        return 0.0
-    return (bid_qty - ask_qty) / denom"""
 
 
 def calculate_size(price: float) -> float:
@@ -366,7 +363,10 @@ async def execute_trade(signal: str, size: float, velocity: float | None = None)
             side=BUY,
             token_id=target["id"],
         )
+        before_singing = time.time()
         signed_order = await asyncio.to_thread(client.create_order, order_args)
+        after_signing = time.time()
+        print(f"   🕒 Signing took {after_signing - before_singing:.4f}")
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(
@@ -451,18 +451,18 @@ async def market_data_listener(state: MarketState) -> None:
                     if ts - last_trigger_time < COOLDOWN_SECONDS or NEEDS_NEW_IDS:
                         continue
 
-                    vel = await state.velocity(window_s=1.0)
+                    vel = await state.velocity(window_s=0.3)
                     vel = float(f"{vel:.1f}")
                     #obi = calculate_obi(bid_qty, ask_qty)
                     size = calculate_size(mid)
 
-                    if vel > VELOCITY_THRESHOLD: #and obi > OBI_THRESHOLD:
+                    if vel > VELOCITY_THRESHOLD and vel < VELOCITY_THRESHOLD_TOPCAP : #and obi > OBI_THRESHOLD:
                         print(
                             f"🚨 BULL SIGNAL! Vel: {vel:.2f} | Size: {size:.2f}"
                         )
                         last_trigger_time = ts
                         await execute_trade("UP", size, vel)
-                    elif vel < -VELOCITY_THRESHOLD: #and obi < -OBI_THRESHOLD:
+                    elif vel < -VELOCITY_THRESHOLD and vel > -VELOCITY_THRESHOLD_TOPCAP: #and obi < -OBI_THRESHOLD:
                         print(
                             f"🚨 BEAR SIGNAL! Vel: {vel:.2f} | Size: {size:.2f}"
                         )
@@ -516,7 +516,7 @@ async def main() -> None:
 
     await refresh_market_ids()
 
-    state = MarketState(maxlen=20)
+    state = MarketState(maxlen=40)
     asyncio.create_task(polymarket_data_stream(client))
     await market_data_listener(state)
 
