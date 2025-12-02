@@ -161,26 +161,22 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
 # --- EXECUTION LOGIC (CALLBACK) ---
 async def execute_trade(direction: str, mid_price: float, velocity: float, gear: float, predicted_jump: float, time_left: float) -> None:
     """
-    This function is called by the Strategy class when a signal fires.
+    Executes a trade at $0.90.
+    Ensures Size * Price = A value with exactly 2 decimal places to satisfy API.
     """
     global NEEDS_NEW_IDS
     
-    print(f"⚡ SIGNAL RECEIVED: {direction} | Vel: {velocity:.2f} | Jump: {predicted_jump*100:.2f}¢")
+    side_label = "UP" if direction == "UP" else "DOWN"
+    print(f"⚡ SIGNAL: {direction} | Ref Price: ${mid_price:.2f} | Vel: {velocity:.2f}")
 
     if client is None:
         print("❌ Client not initialized")
         return
 
-    side_label = "UP" if direction == "UP" else "DOWN"
-    
-    # Calculate Size
-    size = calculate_size(mid_price)
-
     async with CACHE_LOCK:
         target = POLY_MARKET_CACHE[side_label].copy()
-        other = POLY_MARKET_CACHE["DOWN" if side_label == "UP" else "UP"].copy()
 
-    # Pre-flight Checks
+    # --- 1. PRE-FLIGHT CHECKS ---
     if not target["id"]: return
     if time.time() - target["last_updated"] >= DATA_STALENESS_S:
         print("❌ Stale Polymarket book")
@@ -189,47 +185,77 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"❌ Spread too high: {target['spread']}")
         return
 
-    # Price Calculation
-    price = float(f"{target['ask']:.2f}")
-    if price <= 0: price = 0.01
+    # Capture REAL market price for CSV
+    real_market_price = float(f"{target['ask']:.2f}")
+    if real_market_price <= 0: real_market_price = 0.01
 
-    # Filters
-    if price < 0.15 or price > 0.85:
-        print(f"⚠️ Price {price} out of tradeable bounds.")
+    # --- 2. PRICE FILTERS ---
+    if real_market_price < 0.15: 
+        print(f"⚠️ Market Price {real_market_price} too low.")
+        return
+    if real_market_price > 0.85:
+        print(f"⚠️ Market Price {real_market_price} too expensive.")
         return
 
-    # Size Rounding
-    price_cents = int(round(price * 100))
-    step_size_cents = 100 // math.gcd(price_cents, 100)
-    step_size = step_size_cents / 100.0
-    valid_size = math.ceil(size / step_size) * step_size
+    # --- 3. HARDCODED EXECUTION PRICE ---
+    execution_price = 0.90
+
+    # --- 4. MATHEMATICAL SIZE ALIGNMENT (THE FIX) ---
+    # To ensure (Size * 0.90) results in exactly 2 decimal places,
+    # The Size must be a multiple of 0.1 when Price is 0.90.
+    # Logic: 0.1 * 0.90 = 0.09 (Valid). 0.01 * 0.90 = 0.009 (Invalid).
+    
+    min_notional = 1.00
+    
+    # 1. Calculate raw shares to hit $1
+    raw_shares = min_notional / execution_price  # ~1.111
+    
+    # 2. Round UP to nearest 0.10 (The "Safe Step" for $0.90 price)
+    # This turns 1.111 -> 1.20
+    safe_step = 0.10
+    valid_size = math.ceil(raw_shares / safe_step) * safe_step
+    
+    # 3. Final cleanup (float precision fix)
     valid_size = float(f"{valid_size:.2f}")
 
     if DRY_RUN_MODE:
-        print(f"🔧 DRY RUN: BUY {side_label} {valid_size} @ {price}")
+        cost = valid_size * execution_price
+        print(f"🔧 DRY RUN: BUY {side_label} {valid_size} @ ${execution_price} (Cost: ${cost:.3f})")
         return
 
-    # EXECUTE
+    # --- 5. EXECUTE ---
     try:
-        print(f"⏳ BUYING {side_label} {valid_size} @ {price}...")
-        order_args = OrderArgs(price=price, size=valid_size, side=BUY, token_id=target["id"])
+        # Cost check for logs
+        total_cost = valid_size * execution_price
+        print(f"⏳ SENDING: {side_label} {valid_size} @ ${execution_price} (Cost: ${total_cost:.2f})...")
         
-        # Sign and Post
+        order_args = OrderArgs(
+            price=execution_price, 
+            size=valid_size, 
+            side=BUY, 
+            token_id=target["id"]
+        )
+        
         signed_order = await asyncio.to_thread(client.create_order, order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(f"✅ FILLED: {order_id}")
         
-        # Log to Tracker
+        # --- 6. LOGGING ---
         TRACKED_TRADES.append({
-            "timestamp": time.time(), "side": side_label, "entry": price,
-            "spread": target["spread"], "velocity": velocity, "order_id": order_id, "ticks": []
+            "timestamp": time.time(), 
+            "side": side_label, 
+            "entry": real_market_price,  # Log the REAL price, not 0.90
+            "spread": target["spread"], 
+            "velocity": velocity, 
+            "order_id": order_id, 
+            "ticks": []
         })
 
     except PolyApiException as e:
         if "no orders found to match" in str(e):
-             print(f"❌ REJECTED (No Match). Price likely moved.")
+             print(f"❌ REJECTED (No Match).")
         else:
              print(f"❌ API Error: {e}")
     except Exception as e:
@@ -263,15 +289,29 @@ async def main() -> None:
     # 1. Setup Client
     host = os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
     key = os.getenv("PK")
+    
+    # --- RESTORED MISSING PARAMS ---
+    sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
+    funder = os.getenv("FUNDER")
+    chain_id = int(os.getenv("CHAIN_ID", 137))
+    # -------------------------------
+
     creds = ApiCreds(
         api_key=os.getenv("CLOB_API_KEY"),
         api_secret=os.getenv("CLOB_SECRET"),
         api_passphrase=os.getenv("CLOB_PASS_PHRASE")
     )
+    
     client = ClobClient(
-        host, key=key, chain_id=int(os.getenv("CHAIN_ID", 137)), creds=creds
+        host, 
+        key=key, 
+        chain_id=chain_id, 
+        creds=creds,
+        # CRITICAL FIX: Pass these so the client looks at the right wallet
+        signature_type=sig_type,
+        funder=funder
     )
-    print("✅ Polymarket Client Initialized")
+    print(f"✅ Polymarket Client Initialized (Funder: {funder})")
 
     init_csv()
 
@@ -291,13 +331,14 @@ async def main() -> None:
         expiry_timestamp=expiry_timestamp,
         volatility=DEFAULT_VOLATILITY,
         velocity_window=DEFAULT_WINDOW,
-        on_trigger_callback=execute_trade  # <--- Linking the callback here
+        on_trigger_callback=execute_trade
     )
 
     # 4. Run Tasks
     asyncio.create_task(polymarket_data_stream(client))
     await market_data_listener(strategy)
 
+    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
