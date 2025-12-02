@@ -25,7 +25,17 @@ LAST_TRADES_LIMIT = int(LAST_TRADES_LIMIT_RAW) if LAST_TRADES_LIMIT_RAW and LAST
 TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_temp.csv"))
 FINAL_CSV_PATH = os.getenv("TRADE_CSV_FINAL_PATH", os.path.join(PROJECT_ROOT, "trade_analytics_final.csv"))
 TICK_COLUMNS = [f"Tick_{i}" for i in range(1, 9)]
-TEMP_HEADER = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + TICK_COLUMNS
+TEMP_HEADER = [
+    "Timestamp",
+    "Side",
+    "Entry",
+    "Spread",
+    "Volatility",
+    "Velocity",
+    "Gear",
+    "PredJump",
+    "OrderID",
+] + TICK_COLUMNS
 PYTHON_CMD = sys.executable
 
 
@@ -48,7 +58,8 @@ def ensure_header_row(path: str, header: list[str]) -> None:
                 else:
                     if first != header:
                         needs_header = True
-                        existing_rows = [first] + list(reader)
+                        # preserve data rows only (skip mismatched header)
+                        existing_rows = list(reader)
         except Exception:
             needs_header = True
 

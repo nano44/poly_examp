@@ -1,7 +1,12 @@
+import sys
+import os
+
+# 1. Path Fix (Ensures we can import local files if running from root)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import asyncio
 import math
 import csv
-import os
 import time
 import aiohttp
 import orjson
@@ -14,10 +19,9 @@ from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
 
 # IMPORT LOCAL LOGIC
-from examples.transmission import (
+from transmission import (
     ShadowStrategy,
     get_current_window_open,
-    calculate_transmission_coefficient,
     DEFAULT_VOLATILITY,
     DEFAULT_WINDOW
 )
@@ -52,14 +56,47 @@ TRACKED_TRADES: list[dict] = []
 
 # --- ANALYTICS HELPERS ---
 def init_csv() -> None:
-    expected_header = ["Timestamp", "Side", "Entry", "Spread", "Velocity", "OrderID"] + [
-        f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)
-    ]
-    needs_header = not os.path.exists(CSV_FILE)
-    if needs_header:
+    expected_header = [
+        "Timestamp",
+        "Side",
+        "Entry",
+        "Spread",
+        "Volatility",
+        "Velocity",
+        "Gear",
+        "PredJump",
+        "OrderID",
+    ] + [f"Tick_{i}" for i in range(1, TICKS_TO_CAPTURE + 1)]
+    
+    needs_rewrite = False
+
+    # 1. Check if file exists
+    if not os.path.exists(CSV_FILE):
+        needs_rewrite = True
+    else:
+        # 2. If it exists, peek at the first row
+        try:
+            with open(CSV_FILE, "r", newline="") as f:
+                reader = csv.reader(f)
+                existing_header = next(reader)
+                
+                # 3. If headers don't match exactly, we need to rewrite
+                if existing_header != expected_header:
+                    print(f"⚠️ CSV Schema changed. Overwriting {CSV_FILE}...")
+                    needs_rewrite = True
+        except StopIteration:
+            # File exists but is empty
+            needs_rewrite = True
+        except Exception as e:
+            print(f"⚠️ Error reading CSV ({e}). Re-initializing...")
+            needs_rewrite = True
+
+    # 4. Write the new header if needed
+    if needs_rewrite:
         with open(CSV_FILE, "w", newline="") as f:
             csv.writer(f).writerow(expected_header)
 
+            
 def calculate_size(price: float) -> float:
     dist = abs(price - BINANCE_REF_PRICE) if BINANCE_REF_PRICE else abs(price)
     size = MAX_SIZE * math.exp(-(dist**2) / (2 * SIZE_SIGMA**2))
@@ -68,9 +105,6 @@ def calculate_size(price: float) -> float:
 async def get_binance_ref_price(session: aiohttp.ClientSession) -> float:
     if BINANCE_REF_PRICE_OVERRIDE:
         return float(BINANCE_REF_PRICE_OVERRIDE)
-    # Re-use the one from transmission logic if we want, or simple implementation here
-    # Since we have get_current_window_open in transmission, we can rely on that logic there,
-    # but for simple sizing reference, we do a quick check here.
     try:
         url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=1"
         async with session.get(url, timeout=5) as resp:
@@ -151,19 +185,36 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
                     "id": book.asset_id, "bid": best_bid, "ask": best_ask,
                     "spread": spread, "last_updated": now
                 })
-        
+
         # CSV Logging for Active Trades
-        # ... (Existing CSV logic kept abbreviated for clarity) ...
-        
+        for trade in TRACKED_TRADES.copy():
+            side = trade["side"]
+            if side not in POLY_MARKET_CACHE:
+                continue
+            current_price = POLY_MARKET_CACHE[side]["ask"]
+            trade["ticks"].append(current_price)
+            if len(trade["ticks"]) >= TICKS_TO_CAPTURE:
+                row = [
+                    trade["timestamp"],
+                    trade["side"],
+                    trade["entry"],
+                    trade.get("spread", 0.0),
+                    trade.get("volatility", 0.0),
+                    trade.get("velocity", 0.0),
+                    trade.get("gear", 0.0),
+                    trade.get("predicted_jump", 0.0),
+                    trade.get("order_id"),
+                ] + trade["ticks"][:TICKS_TO_CAPTURE]
+                
+                with open(CSV_FILE, "a", newline="") as f:
+                    csv.writer(f).writerow(row)
+                TRACKED_TRADES.remove(trade)
+
         await asyncio.sleep(BOOK_REFRESH_S)
 
 
 # --- EXECUTION LOGIC (CALLBACK) ---
-async def execute_trade(direction: str, mid_price: float, velocity: float, gear: float, predicted_jump: float, time_left: float) -> None:
-    """
-    Executes a trade at $0.90.
-    Ensures Size * Price = A value with exactly 2 decimal places to satisfy API.
-    """
+async def execute_trade(direction: str, mid_price: float, velocity: float, gear: float, predicted_jump: float, time_left: float, volatility: float) -> None:
     global NEEDS_NEW_IDS
     
     side_label = "UP" if direction == "UP" else "DOWN"
@@ -176,7 +227,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     async with CACHE_LOCK:
         target = POLY_MARKET_CACHE[side_label].copy()
 
-    # --- 1. PRE-FLIGHT CHECKS ---
+    # --- PRE-FLIGHT ---
     if not target["id"]: return
     if time.time() - target["last_updated"] >= DATA_STALENESS_S:
         print("❌ Stale Polymarket book")
@@ -185,11 +236,10 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"❌ Spread too high: {target['spread']}")
         return
 
-    # Capture REAL market price for CSV
+    # Real Price for CSV
     real_market_price = float(f"{target['ask']:.2f}")
     if real_market_price <= 0: real_market_price = 0.01
 
-    # --- 2. PRICE FILTERS ---
     if real_market_price < 0.15: 
         print(f"⚠️ Market Price {real_market_price} too low.")
         return
@@ -197,25 +247,17 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"⚠️ Market Price {real_market_price} too expensive.")
         return
 
-    # --- 3. HARDCODED EXECUTION PRICE ---
+    spread_logged = round(target["spread"] / 2, 3)
+
+    # --- HARDCODED EXECUTION ---
     execution_price = 0.90
 
-    # --- 4. MATHEMATICAL SIZE ALIGNMENT (THE FIX) ---
-    # To ensure (Size * 0.90) results in exactly 2 decimal places,
-    # The Size must be a multiple of 0.1 when Price is 0.90.
-    # Logic: 0.1 * 0.90 = 0.09 (Valid). 0.01 * 0.90 = 0.009 (Invalid).
-    
+    # --- SIZE ALIGNMENT ---
+    # Logic: Round UP to nearest 0.10 step to ensure Price(0.9)*Size = 2 decimal places
     min_notional = 1.00
-    
-    # 1. Calculate raw shares to hit $1
-    raw_shares = min_notional / execution_price  # ~1.111
-    
-    # 2. Round UP to nearest 0.10 (The "Safe Step" for $0.90 price)
-    # This turns 1.111 -> 1.20
+    raw_shares = min_notional / execution_price
     safe_step = 0.10
     valid_size = math.ceil(raw_shares / safe_step) * safe_step
-    
-    # 3. Final cleanup (float precision fix)
     valid_size = float(f"{valid_size:.2f}")
 
     if DRY_RUN_MODE:
@@ -223,34 +265,31 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"🔧 DRY RUN: BUY {side_label} {valid_size} @ ${execution_price} (Cost: ${cost:.3f})")
         return
 
-    # --- 5. EXECUTE ---
+    # --- EXECUTE ---
     try:
-        # Cost check for logs
         total_cost = valid_size * execution_price
         print(f"⏳ SENDING: {side_label} {valid_size} @ ${execution_price} (Cost: ${total_cost:.2f})...")
         
         order_args = OrderArgs(
-            price=execution_price, 
-            size=valid_size, 
-            side=BUY, 
-            token_id=target["id"]
+            price=execution_price, size=valid_size, side=BUY, token_id=target["id"]
         )
         
         signed_order = await asyncio.to_thread(client.create_order, order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
-        
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(f"✅ FILLED: {order_id}")
         
-        # --- 6. LOGGING ---
         TRACKED_TRADES.append({
-            "timestamp": time.time(), 
-            "side": side_label, 
-            "entry": real_market_price,  # Log the REAL price, not 0.90
-            "spread": target["spread"], 
-            "velocity": velocity, 
-            "order_id": order_id, 
-            "ticks": []
+            "timestamp": time.time(),
+            "side": side_label,
+            "entry": real_market_price,
+            "spread": spread_logged,
+            "volatility": round(volatility, 2),
+            "velocity": round(velocity, 2),
+            "gear": round(gear, 5),
+            "predicted_jump": round(predicted_jump, 4),
+            "order_id": order_id,
+            "ticks": [],
         })
 
     except PolyApiException as e:
@@ -274,10 +313,7 @@ async def market_data_listener(strategy: ShadowStrategy) -> None:
                 async for msg in ws:
                     data = orjson.loads(msg)
                     mid = (float(data["b"]) + float(data["a"])) / 2.0
-                    
-                    # Pass data to strategy. If strategy triggers, it calls execute_trade
                     strategy.on_market_data(mid)
-                    
         except Exception as e:
             print(f"Stream Error: {e}")
             await asyncio.sleep(backoff)
@@ -286,15 +322,12 @@ async def market_data_listener(strategy: ShadowStrategy) -> None:
 async def main() -> None:
     global BINANCE_REF_PRICE, client
 
-    # 1. Setup Client
+    # 1. Setup Client with Funder Logic
     host = os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
     key = os.getenv("PK")
-    
-    # --- RESTORED MISSING PARAMS ---
     sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
     funder = os.getenv("FUNDER")
     chain_id = int(os.getenv("CHAIN_ID", 137))
-    # -------------------------------
 
     creds = ApiCreds(
         api_key=os.getenv("CLOB_API_KEY"),
@@ -303,13 +336,8 @@ async def main() -> None:
     )
     
     client = ClobClient(
-        host, 
-        key=key, 
-        chain_id=chain_id, 
-        creds=creds,
-        # CRITICAL FIX: Pass these so the client looks at the right wallet
-        signature_type=sig_type,
-        funder=funder
+        host, key=key, chain_id=chain_id, creds=creds,
+        signature_type=sig_type, funder=funder
     )
     print(f"✅ Polymarket Client Initialized (Funder: {funder})")
 
@@ -319,26 +347,23 @@ async def main() -> None:
     async with aiohttp.ClientSession(json_serialize=orjson.dumps) as session:
         BINANCE_REF_PRICE = await get_binance_ref_price(session)
         print(f"✅ Reference Price: ${BINANCE_REF_PRICE}")
-        
-        # Get Strike/Expiry from our Transmission Logic
         strike_price, expiry_timestamp = await get_current_window_open(session)
 
     await refresh_market_ids()
 
-    # 3. Initialize Strategy with the Callback
+    # 3. Initialize Strategy (Fixing Variable Names)
     strategy = ShadowStrategy(
         strike_price=strike_price,
         expiry_timestamp=expiry_timestamp,
-        volatility=DEFAULT_VOLATILITY,
-        velocity_window=DEFAULT_WINDOW,
-        on_trigger_callback=execute_trade
+        volatility=DEFAULT_VOLATILITY, # Fixed NameError
+        velocity_window=DEFAULT_WINDOW, # Fixed NameError
+        on_trigger_callback=execute_trade,
     )
 
     # 4. Run Tasks
     asyncio.create_task(polymarket_data_stream(client))
     await market_data_listener(strategy)
 
-    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
