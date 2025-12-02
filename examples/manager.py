@@ -13,7 +13,7 @@ PROJECT_ROOT = os.path.dirname(MANAGER_DIR)
 
 # Modules to run (Must match the filename without .py)
 FETCH_MODULE = "examples.get_autmatic_ids" 
-TRADE_MODULE = "examples.hft_engine_v2"
+TRADE_MODULE = "examples.engine_improved"
 LAST_TRADES_MODULE = "examples.try_get_lasttrades"
 
 # Optional: set LAST_TRADES_ORDER_IDS as comma-separated list to trigger last-trades fetch on startup.
