@@ -39,7 +39,7 @@ load_dotenv()
 MAX_SIZE = 1.5
 MIN_SIZE = 1.0
 SIZE_SIGMA = 50.0  
-SPREAD_THRESHOLD = 0.03
+SPREAD_THRESHOLD = 0.02
 FAIR_VALUE_EPS = 0.02
 DATA_STALENESS_S = 2.0
 BOOK_REFRESH_S = 0.2
@@ -243,15 +243,19 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
 
     # --- HARDCODED EXECUTION (Market Order Logic) ---
     # We pay up to 0.90 to ensure fill, but 'real_market_price' is what we expect to pay
-    execution_price = 0.90
+    execution_price = market_price + 0.02
 
     # --- SIZE ALIGNMENT ---
-    # Ensure (Size * 0.90) results in valid decimals
+    # Choose a size step so price * size always has <= 2 decimals.
+    # With price in cents (p), size in cents (s), we need p * s % 100 == 0.
+    price_cents = int(round(execution_price * 100))
     min_notional = 1.00
     raw_shares = min_notional / execution_price
-    safe_step = 0.10
-    valid_size = math.ceil(raw_shares / safe_step) * safe_step
-    valid_size = float(f"{valid_size:.2f}")
+
+    step_cents = 100 // math.gcd(price_cents, 100)  # smallest size (in cents) that keeps p*s divisible by 100
+    raw_size_cents = raw_shares * 100
+    valid_size_cents = math.ceil(raw_size_cents / step_cents) * step_cents
+    valid_size = valid_size_cents / 100.0
 
     if DRY_RUN_MODE:
         cost = valid_size * execution_price
