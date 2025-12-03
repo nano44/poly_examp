@@ -54,7 +54,7 @@ async def refresh_market_ids() -> bool:
 
         async with CACHE_LOCK:
             if POLY_MARKET_CACHE["UP"]["id"] != up_id:
-                print(f"🔄 LOADED MARKET: {data.get('market', 'Unknown')} | UP: {up_id[:8]}... | DOWN: {down_id[:8]}...")
+                #(f"🔄 LOADED MARKET: {data.get('market', 'Unknown')} | UP: {up_id[:8]}... | DOWN: {down_id[:8]}...")
                 POLY_MARKET_CACHE["UP"] = {"id": up_id}
                 POLY_MARKET_CACHE["DOWN"] = {"id": down_id}
         NEEDS_NEW_IDS = False
@@ -78,7 +78,7 @@ async def websocket_listener() -> None:
             writer.writerow(HEADER)
 
     uri = "wss://ws-subscriptions-clob.polymarket.com/ws/market" 
-    print("\n--- Polymarket Websocket Tester & Updater ---")
+    #print("\n--- Polymarket Websocket Tester & Updater ---")
     
     while True:
         while NEEDS_NEW_IDS or not cache_has_ids():
@@ -95,7 +95,7 @@ async def websocket_listener() -> None:
                 
                 sub_msg = {"type": "market", "assets_ids": token_ids}
                 await websocket.send(orjson.dumps(sub_msg).decode())
-                print(f"📡 Subscribed. Updating store_price and logging to {CSV_LOG_FILE}...")
+                #print(f"📡 Subscribed. Updating store_price and logging to {CSV_LOG_FILE}...")
 
                 with open(CSV_LOG_FILE, 'a', newline='') as csvfile: 
                     csv_writer = csv.writer(csvfile)
@@ -209,7 +209,7 @@ async def websocket_listener() -> None:
                                     f"DOWN(A:{store_price.DOWN_askprice} B:{store_price.DOWN_bidprice} S:{store_price.spread_down})"
                                 )
                                 
-                                print(f"[{time_delta_ms_print:.1f}ms] | EVENT: {event_type:<18} | {price_info_print:<20} | {store_status}")
+                                #print(f"[{time_delta_ms_print:.1f}ms] | EVENT: {event_type:<18} | {price_info_print:<20} | {store_status}")
                                                             
         except Exception as e:
             print(f"⚠️ WS Connection or Loop Error: {e}. Retrying in 2s...")

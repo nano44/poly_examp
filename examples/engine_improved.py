@@ -18,11 +18,11 @@ from py_clob_client.constants import POLYGON
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
 
-# --- IMPORT SHARED STORE (Global Variables) ---
+# --- 1. IMPORT SHARED STORE (Global Variables) ---
 import examples.store_price as store_price
 
-# --- IMPORT WEBSOCKET LISTENER (Background Task) ---
-# NOTE: Ensure you renamed 'test_websocket.py' to 'poly_cache.py'
+# --- 2. IMPORT WEBSOCKET LISTENER (Background Task) ---
+# This assumes you renamed 'test_websocket.py' to 'poly_cache.py'
 from examples.poly_cache import websocket_listener 
 
 # IMPORT LOCAL LOGIC
@@ -51,8 +51,8 @@ CSV_FILE = "trade_analytics_temp.csv"
 
 # Global State (IDs are still managed locally for Execution)
 POLY_MARKET_CACHE = {
-    "UP": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
-    "DOWN": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
+    "UP": {"id": None},
+    "DOWN": {"id": None},
 }
 NEEDS_NEW_IDS = False
 CACHE_LOCK = asyncio.Lock()
@@ -197,6 +197,8 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     
     side_label = "UP" if direction == "UP" else "DOWN"
     
+    loop_start = time.time()
+
     # 1. READ FROM SHARED STORE (Instant Data)
     if side_label == "UP":
         market_price = store_price.UP_askprice
@@ -244,6 +246,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     execution_price = 0.90
 
     # --- SIZE ALIGNMENT ---
+    # Ensure (Size * 0.90) results in valid decimals
     min_notional = 1.00
     raw_shares = min_notional / execution_price
     safe_step = 0.10
@@ -265,6 +268,8 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         )
         
         signed_order = await asyncio.to_thread(client.create_order, order_args)
+        post_loop = time.time()
+        print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(f"✅ FILLED: {order_id}")
