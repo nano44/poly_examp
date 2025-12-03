@@ -18,6 +18,13 @@ from py_clob_client.constants import POLYGON
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
 
+# --- IMPORT SHARED STORE (Global Variables) ---
+import examples.store_price as store_price
+
+# --- IMPORT WEBSOCKET LISTENER (Background Task) ---
+# NOTE: Ensure you renamed 'test_websocket.py' to 'poly_cache.py'
+from examples.poly_cache import websocket_listener 
+
 # IMPORT LOCAL LOGIC
 from transmission import (
     ShadowStrategy,
@@ -42,7 +49,7 @@ BINANCE_REF_PRICE_OVERRIDE = os.getenv("BINANCE_REF_PRICE_OVERRIDE")
 TICKS_TO_CAPTURE = 8
 CSV_FILE = "trade_analytics_temp.csv"
 
-# Global State
+# Global State (IDs are still managed locally for Execution)
 POLY_MARKET_CACHE = {
     "UP": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
     "DOWN": {"id": None, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0},
@@ -70,28 +77,23 @@ def init_csv() -> None:
     
     needs_rewrite = False
 
-    # 1. Check if file exists
     if not os.path.exists(CSV_FILE):
         needs_rewrite = True
     else:
-        # 2. If it exists, peek at the first row
         try:
             with open(CSV_FILE, "r", newline="") as f:
                 reader = csv.reader(f)
-                existing_header = next(reader)
-                
-                # 3. If headers don't match exactly, we need to rewrite
-                if existing_header != expected_header:
-                    print(f"⚠️ CSV Schema changed. Overwriting {CSV_FILE}...")
+                try:
+                    existing_header = next(reader)
+                    if existing_header != expected_header:
+                        print(f"⚠️ CSV Schema changed. Overwriting {CSV_FILE}...")
+                        needs_rewrite = True
+                except StopIteration:
                     needs_rewrite = True
-        except StopIteration:
-            # File exists but is empty
-            needs_rewrite = True
         except Exception as e:
             print(f"⚠️ Error reading CSV ({e}). Re-initializing...")
             needs_rewrite = True
 
-    # 4. Write the new header if needed
     if needs_rewrite:
         with open(CSV_FILE, "w", newline="") as f:
             csv.writer(f).writerow(expected_header)
@@ -115,7 +117,7 @@ async def get_binance_ref_price(session: aiohttp.ClientSession) -> float:
         return 0.0
 
 
-# --- POLYMARKET LOGIC ---
+# --- POLYMARKET ID MANAGEMENT ---
 async def refresh_market_ids() -> bool:
     global NEEDS_NEW_IDS
     file_path = "active_ids.json"
@@ -133,66 +135,40 @@ async def refresh_market_ids() -> bool:
 
         async with CACHE_LOCK:
             if POLY_MARKET_CACHE["UP"]["id"] != up_id:
-                print(f"🔄 LOADED NEW MARKET: {data.get('market', 'Unknown')}")
-                POLY_MARKET_CACHE["UP"] = {"id": up_id, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0}
-                POLY_MARKET_CACHE["DOWN"] = {"id": down_id, "bid": 0.0, "ask": 0.0, "spread": 0.0, "last_updated": 0.0}
+                print(f"🔄 LOADED NEW MARKET (Engine): {data.get('market', 'Unknown')}")
+                POLY_MARKET_CACHE["UP"] = {"id": up_id}
+                POLY_MARKET_CACHE["DOWN"] = {"id": down_id}
         NEEDS_NEW_IDS = False
         return True
     except Exception as e:
         print(f"❌ Error reading JSON: {e}")
         return False
 
-def resolve_side_for_token(token_id: str) -> str | None:
-    for label, entry in POLY_MARKET_CACHE.items():
-        if entry["id"] == token_id:
-            return label
-    return None
-
-async def polymarket_data_stream(poly_client: ClobClient) -> None:
-    global NEEDS_NEW_IDS
+async def polymarket_csv_logger_loop():
+    """
+    Background task to update CSV ticks.
+    Since we don't have a polling loop anymore, we need a dedicated loop 
+    to periodically update the 'ticks' for tracked trades from the store.
+    """
     while True:
-        if poly_client is None:
-            await asyncio.sleep(1)
-            continue
-        if NEEDS_NEW_IDS or not POLY_MARKET_CACHE["UP"]["id"]:
-            await refresh_market_ids()
-            await asyncio.sleep(1)
-            continue
-
-        try:
-            params = [
-                BookParams(token_id=POLY_MARKET_CACHE["UP"]["id"]),
-                BookParams(token_id=POLY_MARKET_CACHE["DOWN"]["id"]),
-            ]
-            books = await asyncio.to_thread(poly_client.get_order_books, params)
-        except Exception:
-            await asyncio.sleep(BOOK_REFRESH_S)
-            continue
-
-        now = time.time()
-        async with CACHE_LOCK:
-            for book in books:
-                label = resolve_side_for_token(book.asset_id)
-                if not label: continue
-
-                has_bids = len(book.bids) > 0
-                has_asks = len(book.asks) > 0
-                best_bid = float(book.bids[-1].price) if has_bids else 0.0
-                best_ask = float(book.asks[-1].price) if has_asks else 0.0
-                spread = round(best_ask - best_bid, 3) if (has_bids and has_asks) else 999.0
-
-                POLY_MARKET_CACHE[label].update({
-                    "id": book.asset_id, "bid": best_bid, "ask": best_ask,
-                    "spread": spread, "last_updated": now
-                })
-
-        # CSV Logging for Active Trades
+        await asyncio.sleep(0.2) # Update ticks every 200ms
+        
+        if not TRACKED_TRADES: continue
+        
+        # Read current prices from the Shared Store
+        current_up = store_price.UP_askprice
+        current_down = store_price.DOWN_askprice
+        
         for trade in TRACKED_TRADES.copy():
             side = trade["side"]
-            if side not in POLY_MARKET_CACHE:
-                continue
-            current_price = POLY_MARKET_CACHE[side]["ask"]
-            trade["ticks"].append(current_price)
+            
+            # Get current price based on side
+            curr_price = current_up if side == "UP" else current_down
+            
+            if curr_price <= 0: continue # Don't log zeros
+            
+            trade["ticks"].append(curr_price)
+            
             if len(trade["ticks"]) >= TICKS_TO_CAPTURE:
                 row = [
                     trade["timestamp"],
@@ -206,11 +182,13 @@ async def polymarket_data_stream(poly_client: ClobClient) -> None:
                     trade.get("order_id"),
                 ] + trade["ticks"][:TICKS_TO_CAPTURE]
                 
-                with open(CSV_FILE, "a", newline="") as f:
-                    csv.writer(f).writerow(row)
+                try:
+                    with open(CSV_FILE, "a", newline="") as f:
+                        csv.writer(f).writerow(row)
+                except Exception as e:
+                    print(f"CSV Error: {e}")
+                    
                 TRACKED_TRADES.remove(trade)
-
-        await asyncio.sleep(BOOK_REFRESH_S)
 
 
 # --- EXECUTION LOGIC (CALLBACK) ---
@@ -218,27 +196,41 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     global NEEDS_NEW_IDS
     
     side_label = "UP" if direction == "UP" else "DOWN"
-    print(f"⚡ SIGNAL: {direction} | Ref Price: ${mid_price:.2f} | Vel: {velocity:.2f}")
+    
+    # 1. READ FROM SHARED STORE (Instant Data)
+    if side_label == "UP":
+        market_price = store_price.UP_askprice
+        spread = store_price.spread_up
+        token_id = POLY_MARKET_CACHE["UP"].get("id")
+    else:
+        market_price = store_price.DOWN_askprice
+        spread = store_price.spread_down
+        token_id = POLY_MARKET_CACHE["DOWN"].get("id")
+
+    print(f"⚡ SIGNAL: {direction} | Market Price: ${market_price:.2f} | Spread: {spread:.3f}")
 
     if client is None:
         print("❌ Client not initialized")
         return
 
-    async with CACHE_LOCK:
-        target = POLY_MARKET_CACHE[side_label].copy()
+    # --- PRE-FLIGHT CHECKS ---
+    if not token_id:
+        # Try one quick refresh if IDs are missing
+        await refresh_market_ids() 
+        token_id = POLY_MARKET_CACHE[side_label].get("id")
+        if not token_id: return
 
-    # --- PRE-FLIGHT ---
-    if not target["id"]: return
-    if time.time() - target["last_updated"] >= DATA_STALENESS_S:
-        print("❌ Stale Polymarket book")
-        return
-    if target["spread"] >= SPREAD_THRESHOLD:
-        print(f"❌ Spread too high: {target['spread']}")
+    # Check validity of Store Data
+    if market_price <= 0:
+        print(f"⚠️ Store price is 0. Waiting for Websocket data...")
         return
 
-    # Real Price for CSV
-    real_market_price = float(f"{target['ask']:.2f}")
-    if real_market_price <= 0: real_market_price = 0.01
+    if spread >= SPREAD_THRESHOLD:
+        print(f"❌ Spread too high: {spread:.3f}")
+        return
+
+    # Real Price for CSV is the price we see NOW in the store
+    real_market_price = market_price
 
     if real_market_price < 0.15: 
         print(f"⚠️ Market Price {real_market_price} too low.")
@@ -247,13 +239,11 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"⚠️ Market Price {real_market_price} too expensive.")
         return
 
-    spread_logged = round(target["spread"] / 2, 3)
-
-    # --- HARDCODED EXECUTION ---
+    # --- HARDCODED EXECUTION (Market Order Logic) ---
+    # We pay up to 0.90 to ensure fill, but 'real_market_price' is what we expect to pay
     execution_price = 0.90
 
     # --- SIZE ALIGNMENT ---
-    # Logic: Round UP to nearest 0.10 step to ensure Price(0.9)*Size = 2 decimal places
     min_notional = 1.00
     raw_shares = min_notional / execution_price
     safe_step = 0.10
@@ -271,7 +261,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"⏳ SENDING: {side_label} {valid_size} @ ${execution_price} (Cost: ${total_cost:.2f})...")
         
         order_args = OrderArgs(
-            price=execution_price, size=valid_size, side=BUY, token_id=target["id"]
+            price=execution_price, size=valid_size, side=BUY, token_id=token_id
         )
         
         signed_order = await asyncio.to_thread(client.create_order, order_args)
@@ -283,7 +273,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
             "timestamp": time.time(),
             "side": side_label,
             "entry": real_market_price,
-            "spread": spread_logged,
+            "spread": spread,
             "volatility": round(volatility, 2),
             "velocity": round(velocity, 2),
             "gear": round(gear, 5),
@@ -351,17 +341,28 @@ async def main() -> None:
 
     await refresh_market_ids()
 
-    # 3. Initialize Strategy (Fixing Variable Names)
+    # 3. Start Websocket Cache (Background)
+    # This runs the listener which updates store_price.py in real-time
+    print("🔌 Launching internal Websocket Cache...")
+    asyncio.create_task(websocket_listener())
+    
+    # 4. Start CSV Logger (Background)
+    # Since we removed the data stream loop, we need this to log ticks
+    asyncio.create_task(polymarket_csv_logger_loop())
+
+    # Wait for websocket to warm up
+    await asyncio.sleep(2)
+
+    # 5. Initialize Strategy
     strategy = ShadowStrategy(
         strike_price=strike_price,
         expiry_timestamp=expiry_timestamp,
-        volatility=DEFAULT_VOLATILITY, # Fixed NameError
-        velocity_window=DEFAULT_WINDOW, # Fixed NameError
+        volatility=DEFAULT_VOLATILITY, 
+        velocity_window=DEFAULT_WINDOW, 
         on_trigger_callback=execute_trade,
     )
 
-    # 4. Run Tasks
-    asyncio.create_task(polymarket_data_stream(client))
+    # 6. Run Tasks
     await market_data_listener(strategy)
 
 if __name__ == "__main__":
