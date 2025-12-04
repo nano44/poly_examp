@@ -17,6 +17,7 @@ from py_clob_client.clob_types import ApiCreds, BookParams, OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
+from sign_order import FastPolymarketSigner
 
 # --- 1. IMPORT SHARED STORE (Global Variables) ---
 import examples.store_price as store_price
@@ -57,6 +58,7 @@ POLY_MARKET_CACHE = {
 NEEDS_NEW_IDS = False
 CACHE_LOCK = asyncio.Lock()
 client: ClobClient | None = None
+signer: FastPolymarketSigner | None = None
 BINANCE_REF_PRICE = 0.0
 TRACKED_TRADES: list[dict] = []
 
@@ -211,6 +213,12 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
 
     print(f"⚡ SIGNAL: {direction} | Market Price: ${market_price:.2f} | Spread: {spread:.3f}")
 
+    
+    if signer is None:
+        print("❌ CRITICAL: Signer is not initialized!")
+        return
+    
+    
     if client is None:
         print("❌ Client not initialized")
         return
@@ -270,11 +278,14 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         order_args = OrderArgs(
             price=execution_price, size=valid_size, side=BUY, token_id=token_id
         )
+
+        signed_payload = signer.sign_order(order_args)
         
-        signed_order = await asyncio.to_thread(client.create_order, order_args)
         post_loop = time.time()
         print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
-        resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
+
+        resp = await asyncio.to_thread(client.post_order, signed_payload, OrderType.FAK)
+
         post_send = time.time()
         print(f"⏱️ Order posted & signed in {(post_send - loop_start)*1000:.1f}ms.")
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
@@ -321,7 +332,7 @@ async def market_data_listener(strategy: ShadowStrategy) -> None:
             backoff = min(backoff * 2, 10)
 
 async def main() -> None:
-    global BINANCE_REF_PRICE, client
+    global BINANCE_REF_PRICE, client, signer
 
     # 1. Setup Client with Funder Logic
     host = os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
@@ -360,6 +371,9 @@ async def main() -> None:
     # 4. Start CSV Logger (Background)
     # Since we removed the data stream loop, we need this to log ticks
     asyncio.create_task(polymarket_csv_logger_loop())
+
+    signer = FastPolymarketSigner(private_key_hex=key, funder=funder)
+    print(f"✅ Fast Signer Initialized (Maker: {signer.maker_address})")
 
     # Wait for websocket to warm up
     await asyncio.sleep(2)
