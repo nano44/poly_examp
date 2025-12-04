@@ -1,1 +1,2 @@
 Timestamp,Side,Entry,Spread,Volatility,Velocity,Gear,PredJump,OrderID,Tick_1,Tick_2,Tick_3,Tick_4,Tick_5,Tick_6,Tick_7,Tick_8
+1764865875.9401906,UP,0.34,0.01,0.6,16.37,0.00131,0.0215,0x46de6b8cdbfca7f108b6c8fbdc3283bbf1f34784e75003e93975fbc25f67e440,0.36,0.36,0.36,0.35,0.35,0.35,0.35,0.34

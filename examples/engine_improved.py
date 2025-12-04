@@ -275,6 +275,8 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         post_loop = time.time()
         print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FAK)
+        post_send = time.time()
+        print(f"⏱️ Order posted & signed in {(post_send - loop_start)*1000:.1f}ms.")
         order_id = resp.get("orderID") if isinstance(resp, dict) else resp
         print(f"✅ FILLED: {order_id}")
         
