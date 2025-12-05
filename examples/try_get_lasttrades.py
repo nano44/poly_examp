@@ -3,6 +3,7 @@ import asyncio
 import os
 from functools import lru_cache
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
@@ -62,16 +63,10 @@ async def _get_recent_trades(limit: int = DEFAULT_TRADE_FETCH_LIMIT) -> list[dic
 
     client = get_authenticated_client()
 
-    # 2. Create the parameters object
-    # Note: We filter by maker_address to restrict to your user.
-    # If your version supports 'limit' or 'next_page' token, add it here.
-    # If 'limit' causes an error, remove it and filter manually after fetching.
     params = TradeParams(
         maker_address=USER_ADDRESS,
-        # limit=limit # Uncomment this if your version of TradeParams supports 'limit'
     )
 
-    # 3. Pass the params object to get_trades
     trades = await asyncio.to_thread(client.get_trades, params)
     
     # Slice locally in case the API returned more than requested
@@ -80,16 +75,26 @@ async def _get_recent_trades(limit: int = DEFAULT_TRADE_FETCH_LIMIT) -> list[dic
     
 def _simplify_trade(trade: dict) -> dict:
     """
-    Reduce a raw trade object to {order_id, price, size}.
-    Assumes your own order id is the taker_order_id (you are the taker).
+    Reduce a raw trade object to {order_id, price, size, timestamp}.
     """
     size_raw = trade.get("size")
     price_raw = trade.get("price")
+    timestamp_raw = trade.get("timestamp")
+
+    # Polymarket usually returns timestamps as unix integers (seconds)
+    # converting to readable format if present
+    timestamp_val = None
+    if timestamp_raw is not None:
+        try:
+            timestamp_val = int(timestamp_raw)
+        except (ValueError, TypeError):
+            timestamp_val = timestamp_raw
 
     return {
         "order_id": trade.get("taker_order_id"),
         "price": float(price_raw) if price_raw is not None else None,
         "size": round(float(size_raw), 2) if size_raw is not None else None,
+        "timestamp": timestamp_val  # <--- ADDED FIELD
     }
 
 
@@ -101,7 +106,7 @@ async def get_trades_for_order_ids(
     Public async function:
     - Fetches the last `limit` trades for the authenticated user
     - Filters them to only keep trades whose taker_order_id is in `order_ids`
-    - Returns a list of {order_id, price, size} dicts
+    - Returns a list of {order_id, price, size, timestamp} dicts
     """
     if not order_ids:
         return []
@@ -125,7 +130,12 @@ def _print_trades(trades: List[Dict[str, Any]], limit: int, order_ids: List[str]
 
     print(f"✅ Found {len(trades)} matching trades for {len(order_ids)} order IDs:\n")
     for t in trades:
-        print(f"Order ID: {t['order_id']} | Price: {t['price']} | Size: {t['size']}")
+        # Format timestamp to human-readable if it's an integer
+        ts_display = t['timestamp']
+        if isinstance(ts_display, (int, float)):
+            ts_display = datetime.fromtimestamp(ts_display).strftime('%Y-%m-%d %H:%M:%S')
+            
+        print(f"Order ID: {t['order_id']} | Price: {t['price']} | Size: {t['size']} | Time: {ts_display}")
 
 
 async def _cli_main(order_ids: List[str], limit: int) -> None:

@@ -18,7 +18,7 @@ from py_clob_client.constants import POLYGON
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
 from sign_order import FastPolymarketSigner
-from wss_trade_monitor import PolymarketLatencyMonitor
+#from wss_trade_monitor import PolymarketLatencyMonitor
 
 # --- 1. IMPORT SHARED STORE (Global Variables) ---
 import examples.store_price as store_price
@@ -62,7 +62,7 @@ client: ClobClient | None = None
 signer: FastPolymarketSigner | None = None
 BINANCE_REF_PRICE = 0.0
 TRACKED_TRADES: list[dict] = []
-monitor: PolymarketLatencyMonitor | None = None
+#monitor: PolymarketLatencyMonitor | None = None
 
 
 # --- ANALYTICS HELPERS ---
@@ -302,8 +302,8 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
             order_id = resp.get("orderID")
             
             # Tell the background monitor: "I sent this ID at this time"
-            if monitor and order_id:
-                 monitor.mark_sent(order_id, time_order_sent)
+            """if monitor and order_id:
+                 monitor.mark_sent(order_id, time_order_sent)"""
                  
             print(f"✅ FILLED: {order_id}")
             
@@ -375,14 +375,14 @@ async def main() -> None:
     )
     print(f"✅ Polymarket Client Initialized (Funder: {funder})")
 
-    global monitor
+    """global monitor
     print("🔌 Starting Latency Monitor...")
     monitor = PolymarketLatencyMonitor(
         api_key=os.getenv("CLOB_API_KEY"),
         api_secret=os.getenv("CLOB_SECRET"),
         passphrase=os.getenv("CLOB_PASS_PHRASE")
     )
-    await monitor.start()
+    await monitor.start()"""
 
     init_csv()
 
