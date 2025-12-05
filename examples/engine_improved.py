@@ -18,6 +18,7 @@ from py_clob_client.constants import POLYGON
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY
 from sign_order import FastPolymarketSigner
+from wss_trade_monitor import PolymarketLatencyMonitor
 
 # --- 1. IMPORT SHARED STORE (Global Variables) ---
 import examples.store_price as store_price
@@ -61,6 +62,7 @@ client: ClobClient | None = None
 signer: FastPolymarketSigner | None = None
 BINANCE_REF_PRICE = 0.0
 TRACKED_TRADES: list[dict] = []
+monitor: PolymarketLatencyMonitor | None = None
 
 
 # --- ANALYTICS HELPERS ---
@@ -271,7 +273,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"🔧 DRY RUN: BUY {side_label} {valid_size} @ ${execution_price} (Cost: ${cost:.3f})")
         return
 
-    # --- EXECUTE ---
+# --- EXECUTE ---
     try:
         total_cost = valid_size * execution_price
         print(f"⏳ SENDING: {side_label} {valid_size} @ ${execution_price} (Cost: ${total_cost:.2f})...")
@@ -280,31 +282,50 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
             price=execution_price, size=valid_size, side=BUY, token_id=token_id
         )
 
+        # 1. Sign the order locally (Fast)
         signed_payload = signer.sign_order(order_args)
         
         post_loop = time.time()
-        #print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
-        print(f"Order process took {(post_loop - time_start)*1000:.1f}ms.")
-        time_order_sent = time.time()
+        print(f"Order process/signing took {(post_loop - time_start)*1000:.1f}ms.")
+
+        # [LATENCY LOGIC START] ==========================================
+        # 2. CAPTURE TIMESTAMP (The "Start" of the race)
+        time_order_sent = time.time() 
+        
+        # 3. SEND ORDER (Network Call)
+        # We use FAK (Fill and Kill) or FOK (Fill or Kill) as per your strategy
         resp = await asyncio.to_thread(client.post_order, signed_payload, OrderType.FAK)
 
-        post_send = time.time()
-        print(f"⏱️ Order posted & signed in {(post_send - loop_start)*1000:.1f}ms.")
-        order_id = resp.get("orderID") if isinstance(resp, dict) else resp
-        print(f"✅ FILLED: {order_id}")
-        
-        TRACKED_TRADES.append({
-            "timestamp": time.time(),
-            "side": side_label,
-            "entry": real_market_price,
-            "spread": spread,
-            "volatility": round(volatility, 2),
-            "velocity": round(velocity, 2),
-            "gear": round(gear, 5),
-            "predicted_jump": round(predicted_jump, 4),
-            "order_id": order_id,
-            "ticks": [],
-        })
+        # 4. NOTIFY MONITOR
+        # Check if response is a dict and has success=True (Standard Poly response)
+        if isinstance(resp, dict) and resp.get("success"):
+            order_id = resp.get("orderID")
+            
+            # Tell the background monitor: "I sent this ID at this time"
+            if monitor and order_id:
+                 monitor.mark_sent(order_id, time_order_sent)
+                 
+            print(f"✅ FILLED: {order_id}")
+            
+            # Add to local analytics tracking
+            TRACKED_TRADES.append({
+                "timestamp": time.time(),
+                "side": side_label,
+                "entry": real_market_price,
+                "spread": spread,
+                "volatility": round(volatility, 2),
+                "velocity": round(velocity, 2),
+                "gear": round(gear, 5),
+                "predicted_jump": round(predicted_jump, 4),
+                "order_id": order_id,
+                "ticks": [],
+            })
+            
+        else:
+            # Handle failure or unexpected response format
+            error_msg = resp.get("errorMsg") if isinstance(resp, dict) else resp
+            print(f"❌ FAILED: {error_msg}")
+        # [LATENCY LOGIC END] ============================================
 
     except PolyApiException as e:
         if "no orders found to match" in str(e):
@@ -313,7 +334,6 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
              print(f"❌ API Error: {e}")
     except Exception as e:
         print(f"❌ Unexpected Error: {e}")
-
 
 # --- MAIN ENTRY POINT ---
 async def market_data_listener(strategy: ShadowStrategy) -> None:
@@ -354,6 +374,15 @@ async def main() -> None:
         signature_type=sig_type, funder=funder
     )
     print(f"✅ Polymarket Client Initialized (Funder: {funder})")
+
+    global monitor
+    print("🔌 Starting Latency Monitor...")
+    monitor = PolymarketLatencyMonitor(
+        api_key=os.getenv("CLOB_API_KEY"),
+        api_secret=os.getenv("CLOB_SECRET"),
+        passphrase=os.getenv("CLOB_PASS_PHRASE")
+    )
+    await monitor.start()
 
     init_csv()
 
