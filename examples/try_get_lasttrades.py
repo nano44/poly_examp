@@ -79,7 +79,8 @@ def _simplify_trade(trade: dict) -> dict:
     """
     size_raw = trade.get("size")
     price_raw = trade.get("price")
-    timestamp_raw = trade.get("timestamp")
+    timestamp_raw = trade.get("match_time")
+    print(f"Raw timestamp: {timestamp_raw}")
 
     # Polymarket usually returns timestamps as unix integers (seconds)
     # converting to readable format if present
@@ -141,6 +142,7 @@ def _print_trades(trades: List[Dict[str, Any]], limit: int, order_ids: List[str]
 async def _cli_main(order_ids: List[str], limit: int) -> None:
     print(f"⏳ Fetching recent trades and matching {len(order_ids)} order IDs...")
     trades = await get_trades_for_order_ids(order_ids, limit=limit)
+    print(trades)
     _print_trades(trades, limit, order_ids)
 
 

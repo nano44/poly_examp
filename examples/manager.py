@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta # <--- Added timedelta
 
 # --- CONFIGURATION ---
 MANAGER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -148,19 +148,65 @@ def write_csv_rows(csv_path: str, fieldnames: list[str], rows: list[dict]) -> No
     except Exception as e:
         print(f"[Manager] ⚠️ Could not write rows to {csv_path}: {e}")
 
+# --- UPDATED: Parsing logic to handle Time ---
 def parse_helper_output(output: str) -> list[dict]:
     trades: list[dict] = []
     for line in output.splitlines():
         if not line.startswith("Order ID:"): continue
         try:
+            # Expected format: 
+            # Order ID: ... | Price: ... | Size: ... | Time: YYYY-MM-DD HH:MM:SS
             parts = [p.strip() for p in line.split("|")]
+            
             oid = parts[0].split("Order ID:")[1].strip()
             price_part = parts[1].split("Price:")[1].strip()
             size_part = parts[2].split("Size:")[1].strip()
-            trades.append({"order_id": oid, "price": float(price_part), "size": float(size_part)})
-        except Exception:
+            
+            # Extract Time
+            trade_dt = None
+            if len(parts) >= 4 and "Time:" in parts[3]:
+                time_str = parts[3].split("Time:")[1].strip()
+                if time_str and time_str != "N/A":
+                    try:
+                        trade_dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        print(f"[Manager] ⚠️ Date parse error: {time_str}")
+                        trade_dt = None
+
+            trades.append({
+                "order_id": oid, 
+                "price": float(price_part), 
+                "size": float(size_part),
+                "datetime": trade_dt # Store datetime object
+            })
+        except Exception as e:
+            print(f"[Manager] Warning parsing line: {e}")
             continue
     return trades
+
+# --- NEW: Calculation Logic ---
+def calculate_time_till_strike(trade_dt: datetime) -> str:
+    """
+    Calculates seconds remaining until the next 15-minute strike 
+    (:00, :15, :30, :45).
+    """
+    if not trade_dt:
+        return "N/A"
+    
+    # Logic: Round minutes down to nearest 15, then add 15 minutes
+    base = trade_dt.replace(second=0, microsecond=0)
+    minute = base.minute
+    
+    floored_minute = (minute // 15) * 15
+    current_window_start = base.replace(minute=floored_minute)
+    next_strike = current_window_start + timedelta(minutes=15)
+    
+    # Calculate Difference
+    diff = next_strike - trade_dt
+    seconds_left = int(diff.total_seconds())
+    
+    # Handle rare clock skew edge cases
+    return str(max(0, seconds_left))
 
 def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict]):
     remaining = list(csv_rows)
@@ -172,19 +218,23 @@ def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict
         if match_index is None: continue
         row = remaining.pop(match_index)
         
+        # --- APPLY CALCULATION ---
+        time_till_strike = calculate_time_till_strike(ht.get("datetime"))
+        
         # Merge API Data + CSV Data
         combined = {
             "order_id": oid,
-            "price": ht.get("price"), # Actual Filled Price (from API)
-            "size": ht.get("size"),   # Actual Filled Size (from API)
+            "price": ht.get("price"), # Actual Filled Price
+            "size": ht.get("size"),   # Actual Filled Size
             "timestamp": row.get("Timestamp"),
             "side": row.get("Side"),
-            "entry": row.get("Entry"),       # Market Price at trigger time
+            "entry": row.get("Entry"),       
             "spread": row.get("Spread"),
             "velocity": row.get("Velocity"),
-            "volatility": row.get("Volatility"), # <--- Added
-            "gear": row.get("Gear"),             # <--- Added
-            "pred_jump": row.get("PredJump")     # <--- Added
+            "volatility": row.get("Volatility"),
+            "gear": row.get("Gear"),             
+            "pred_jump": row.get("PredJump"),
+            "time_till_strike": time_till_strike # <--- Added Field
         }
         for key, val in row.items():
             if key.startswith("Tick_"):
@@ -196,7 +246,7 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
     """Append enriched rows to the final CSV."""
     if not rows: return
 
-    # --- UPDATED FINAL HEADER ---
+    # --- UPDATED HEADER ---
     fieldnames = [
         "Timestamp",
         "Side",
@@ -207,6 +257,7 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
         "Velocity",
         "Gear",
         "PredJump",
+        "Time till strike", # <--- New Header Column
         "OrderID",
         "Size",
     ] + TICK_COLUMNS
@@ -223,6 +274,7 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
             "Velocity": r.get("velocity"),
             "Gear": r.get("gear"),
             "PredJump": r.get("pred_jump"),
+            "Time till strike": r.get("time_till_strike"), # <--- Map the value
             "OrderID": r.get("order_id"),
             "Size": r.get("size"),
         }
