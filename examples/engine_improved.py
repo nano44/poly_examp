@@ -196,6 +196,7 @@ async def polymarket_csv_logger_loop():
 # --- EXECUTION LOGIC (CALLBACK) ---
 async def execute_trade(direction: str, mid_price: float, velocity: float, gear: float, predicted_jump: float, time_left: float, volatility: float) -> None:
     global NEEDS_NEW_IDS
+    time_start = time.time()
     
     side_label = "UP" if direction == "UP" else "DOWN"
     
@@ -282,8 +283,9 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         signed_payload = signer.sign_order(order_args)
         
         post_loop = time.time()
-        print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
-
+        #print(f"⏱️ Order signed in {(post_loop - loop_start)*1000:.1f}ms. Posting to API...")
+        print(f"Order process took {(post_loop - time_start)*1000:.1f}ms.")
+        time_order_sent = time.time()
         resp = await asyncio.to_thread(client.post_order, signed_payload, OrderType.FAK)
 
         post_send = time.time()
