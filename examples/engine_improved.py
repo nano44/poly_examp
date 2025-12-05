@@ -361,6 +361,7 @@ async def main() -> None:
         print(f"✅ Reference Price: ${BINANCE_REF_PRICE}")
         strike_price, expiry_timestamp = await get_current_window_open(session)
 
+
     await refresh_market_ids()
 
     # 3. Start Websocket Cache (Background)
@@ -372,11 +373,12 @@ async def main() -> None:
     # Since we removed the data stream loop, we need this to log ticks
     asyncio.create_task(polymarket_csv_logger_loop())
 
-    signer = FastPolymarketSigner(private_key_hex=key, funder=funder)
-    print(f"✅ Fast Signer Initialized (Maker: {signer.maker_address})")
 
     # Wait for websocket to warm up
     await asyncio.sleep(2)
+
+    signer = FastPolymarketSigner(private_key_hex=key, funder=funder, signature_type=sig_type)
+    print(f"✅ Fast Signer Initialized (Maker: {signer.maker_address}, Type: {signer.signature_type})")
 
     # 5. Initialize Strategy
     strategy = ShadowStrategy(
