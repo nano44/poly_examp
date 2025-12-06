@@ -243,7 +243,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         return
 
     # Real Price for CSV is the price we see NOW in the store
-    real_market_price = market_price
+    real_market_price = round(market_price, 2)
 
     if real_market_price < 0.20: 
         print(f"⚠️ Market Price {real_market_price} too low.")
@@ -252,9 +252,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         print(f"⚠️ Market Price {real_market_price} too expensive.")
         return
 
-    # --- HARDCODED EXECUTION (Market Order Logic) ---
-    # We pay up to 0.90 to ensure fill, but 'real_market_price' is what we expect to pay
-    execution_price = market_price + 0.02
+    execution_price = round(real_market_price + 0.02, 2)
 
     valid_size = 5.0
 
