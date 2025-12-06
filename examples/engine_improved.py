@@ -245,10 +245,10 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     # Real Price for CSV is the price we see NOW in the store
     real_market_price = market_price
 
-    if real_market_price < 0.15: 
+    if real_market_price < 0.20: 
         print(f"⚠️ Market Price {real_market_price} too low.")
         return
-    if real_market_price > 0.85:
+    if real_market_price > 0.80:
         print(f"⚠️ Market Price {real_market_price} too expensive.")
         return
 
@@ -256,17 +256,19 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
     # We pay up to 0.90 to ensure fill, but 'real_market_price' is what we expect to pay
     execution_price = market_price + 0.02
 
+    valid_size = 5.0
+
     # --- SIZE ALIGNMENT ---
     # Choose a size step so price * size always has <= 2 decimals.
     # With price in cents (p), size in cents (s), we need p * s % 100 == 0.
-    price_cents = int(round(execution_price * 100))
+    """price_cents = int(round(execution_price * 100))
     min_notional = 1.00
     raw_shares = min_notional / execution_price
 
     step_cents = 100 // math.gcd(price_cents, 100)  # smallest size (in cents) that keeps p*s divisible by 100
     raw_size_cents = raw_shares * 100
     valid_size_cents = math.ceil(raw_size_cents / step_cents) * step_cents
-    valid_size = valid_size_cents / 100.0
+    valid_size = valid_size_cents / 100.0"""
 
     if DRY_RUN_MODE:
         cost = valid_size * execution_price

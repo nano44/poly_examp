@@ -19,7 +19,7 @@ DEFAULT_WINDOW = 1.0
 BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT")
 
 def calculate_transmission_coefficient(spot_price, strike_price, time_to_expiry_sec, annual_volatility):
-    if time_to_expiry_sec < 2: return 0.0
+    if time_to_expiry_sec < 60: return 0.0
     t_years = time_to_expiry_sec / SECONDS_IN_YEAR
     std_dev_move = spot_price * annual_volatility * math.sqrt(t_years)
     
