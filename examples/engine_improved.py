@@ -296,6 +296,8 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
         # We use FAK (Fill and Kill) or FOK (Fill or Kill) as per your strategy
         resp = await asyncio.to_thread(client.post_order, signed_payload, OrderType.FAK)
 
+        real_spread = store_price.spread_up if side_label == "UP" else store_price.spread_down
+
         # 4. NOTIFY MONITOR
         # Check if response is a dict and has success=True (Standard Poly response)
         if isinstance(resp, dict) and resp.get("success"):
@@ -312,7 +314,7 @@ async def execute_trade(direction: str, mid_price: float, velocity: float, gear:
                 "timestamp": time.time(),
                 "side": side_label,
                 "entry": real_market_price,
-                "spread": spread,
+                "spread": real_spread,
                 "volatility": round(volatility, 2),
                 "velocity": round(velocity, 2),
                 "gear": round(gear, 5),

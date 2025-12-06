@@ -208,6 +208,14 @@ def calculate_time_till_strike(trade_dt: datetime) -> str:
     # Handle rare clock skew edge cases
     return str(max(0, seconds_left))
 
+def calculate_half_spread(raw_spread) -> str:
+    """Return half of the spread rounded to 3 decimals; empty string on failure."""
+    try:
+        spread_val = float(raw_spread)
+    except (TypeError, ValueError):
+        return ""
+    return f"{spread_val / 2:.3f}"
+
 def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict]):
     remaining = list(csv_rows)
     enriched: list[dict] = []
@@ -220,6 +228,7 @@ def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict
         
         # --- APPLY CALCULATION ---
         time_till_strike = calculate_time_till_strike(ht.get("datetime"))
+        half_spread = calculate_half_spread(row.get("Spread"))
         
         # Merge API Data + CSV Data
         combined = {
@@ -229,7 +238,7 @@ def enrich_helper_trades_with_csv(helper_trades: list[dict], csv_rows: list[dict
             "timestamp": row.get("Timestamp"),
             "side": row.get("Side"),
             "entry": row.get("Entry"),       
-            "spread": row.get("Spread"),
+            "half_spread": half_spread,
             "velocity": row.get("Velocity"),
             "volatility": row.get("Volatility"),
             "gear": row.get("Gear"),             
@@ -252,7 +261,7 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
         "Side",
         "Thought entry price",
         "Actual entry price",
-        "Spread",
+        "HalfSpread",
         "Volatility",
         "Velocity",
         "Gear",
@@ -269,7 +278,7 @@ def append_final_rows(rows: list[dict], path: str = FINAL_CSV_PATH) -> None:
             "Side": r.get("side"),
             "Thought entry price": r.get("entry"),
             "Actual entry price": r.get("price"),
-            "Spread": r.get("spread"),
+            "HalfSpread": r.get("half_spread"),
             "Volatility": r.get("volatility"),
             "Velocity": r.get("velocity"),
             "Gear": r.get("gear"),

@@ -1,3 +1,3 @@
-Timestamp,Side,Thought entry price,Actual entry price,Spread,Volatility,Velocity,Gear,PredJump,Time till strike,OrderID,Size,Tick_1,Tick_2,Tick_3,Tick_4,Tick_5,Tick_6,Tick_7,Tick_8
-1764954595.0080495,UP,0.51,0.53,0.01,0.6,11.54,0.00241,0.0278,306,0xe576887e71e483f53e38d203449891e771660c01d6b25638e5367cd681ddc04f,2.0,0.54,0.55,0.55,0.55,0.55,0.55,0.54,0.53
-1764954593.0475602,UP,0.49,0.5,0.01,0.6,8.7,0.00239,0.0208,308,0x1d1ed4287f0e1f2e36240b0645d1cf90c0c5c0c915276d337aa180e221bf9150,2.04,0.5,0.5,0.51,0.51,0.51,0.51,0.51,0.52
+Timestamp,Side,Thought entry price,Actual entry price,HalfSpread,Volatility,Velocity,Gear,PredJump,Time till strike,OrderID,Size,Tick_1,Tick_2,Tick_3,Tick_4,Tick_5,Tick_6,Tick_7,Tick_8
+1765035039.644658,UP,0.52,0.54,0.005,0.6,14.27,0.00142,0.0202,861,0x49b676461c592039d6bff53e3c2b4075edfce41c1a200001296db8bcd9bc8cc1,2.0,0.55,0.55,0.55,0.55,0.55,0.54,0.55,0.55
+1765035032.0222542,DOWN,0.47,0.48,0.005,0.6,-19.24,0.00141,-0.0272,869,0xd08dde59f25040552b2103edb1231430a2286d8938d135d1cc843615c6d992d5,3.06,0.48,0.49,0.49,0.49,0.49,0.49,0.49,0.49

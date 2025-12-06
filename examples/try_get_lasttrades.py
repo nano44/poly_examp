@@ -80,7 +80,7 @@ def _simplify_trade(trade: dict) -> dict:
     size_raw = trade.get("size")
     price_raw = trade.get("price")
     timestamp_raw = trade.get("match_time")
-    print(f"Raw timestamp: {timestamp_raw}")
+    #print(f"Raw timestamp: {timestamp_raw}")
 
     # Polymarket usually returns timestamps as unix integers (seconds)
     # converting to readable format if present
